@@ -65,7 +65,7 @@ def detect_sep(path):
 #     return X
 def load_counts(counts_path, num_genes: int | None = None):
     """
-    Read counts: first 2 columns = gene_name, entrez_id; remaining columns = samples.
+    Read counts: first 2 columns = gene_name, entrez_id; remaining columns = samples. 
     Returns:
       X (DataFrame): samples x genes (transposed, columns = gene_symbol)
     If num_genes is set, keep only the first num_genes genes in the *file order*
