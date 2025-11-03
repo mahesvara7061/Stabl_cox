@@ -1,3 +1,5 @@
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 from .unionfind import UnionFind
 import sys
 from tqdm.autonotebook import tqdm
@@ -13,6 +15,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.impute import SimpleImputer
 from sklearn import clone
+# >>> SURVIVAL PATCH: imports
+from sksurv.metrics import concordance_index_censored
+from sklearn.model_selection import RepeatedKFold
 from pathlib import Path
 import os
 import numpy as np
@@ -20,6 +25,9 @@ import pandas as pd
 import warnings
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.utils._testing import ignore_warnings
+from sksurv.util import Surv
+from sksurv.linear_model import CoxPHSurvivalAnalysis
+
 
 warnings.filterwarnings('ignore')
 warnings.simplefilter('ignore', category=ConvergenceWarning)
@@ -139,13 +147,28 @@ def multi_omic_stabl_cv(
     if early_fusion:
         models += ["EF " + model for model in models if "STABL" not in model]
 
-    lasso = estimators["lasso"]
-    alasso = estimators["alasso"]
-    en = estimators["en"]
+    # lasso = estimators["lasso"]
+    # alasso = estimators["alasso"]
+    # en = estimators["en"]
 
-    stabl = estimators["stabl_lasso"]
-    stabl_alasso = estimators["stabl_alasso"]
-    stabl_en = estimators["stabl_en"]
+    # stabl = estimators["stabl_lasso"]
+    # stabl_alasso = estimators["stabl_alasso"]
+    # stabl_en = estimators["stabl_en"]
+
+    lasso = estimators.get("lasso")
+    alasso = estimators.get("alasso")
+    en = estimators.get("en")
+
+    stabl = estimators.get("stabl_lasso")
+    stabl_alasso = estimators.get("stabl_alasso")
+    stabl_en = estimators.get("stabl_en")
+    # >>> SURVIVAL PATCH: lấy Cox (nếu có)
+    stabl_cox = estimators.get("stabl_cox", None)
+
+    if task_type == "survival" and stabl_cox is not None:
+        from sksurv.linear_model import CoxnetSurvivalAnalysis
+        if not isinstance(stabl_cox.base_estimator, CoxnetSurvivalAnalysis):
+            warnings.warn("For survival, base_estimator should be CoxnetSurvivalAnalysis")
 
     os.makedirs(Path(save_path, "Training CV"), exist_ok=True)
     os.makedirs(Path(save_path, "Summary"), exist_ok=True)
@@ -192,6 +215,37 @@ def multi_omic_stabl_cv(
             # Preprocessing of X_tmp
             X_tmp = remove_low_info_samples(X_tmp)
             y_tmp = y.loc[X_tmp.index]
+
+            # ADD THIS BLOCK:
+            if task_type == "survival":
+                import warnings
+                from scipy.stats import skew
+                
+                # Remove time=0
+                if "time" in y_tmp.columns:
+                    n_zero = (y_tmp["time"] == 0).sum()
+                    if n_zero > 0:
+                        warnings.warn(f"Removing {n_zero} samples with time=0 from {omic_name}")
+                        mask_valid = y_tmp["time"] > 0
+                        X_tmp = X_tmp[mask_valid]
+                        y_tmp = y_tmp[mask_valid]
+                        if outer_groups is not None:
+                            groups = outer_groups[X_tmp.index]
+                
+                    # Log-transform if skewed
+                    time_skewness = skew(y_tmp["time"].values)
+                    if time_skewness > 2:
+                        warnings.warn(f"Survival times skewed ({time_skewness:.2f}). Applying log1p.")
+                        y_tmp = y_tmp.copy()
+                        y_tmp["time"] = np.log1p(y_tmp["time"])
+                
+                    # Report quality
+                    n_events = y_tmp["event"].sum()
+                    print(f"  {omic_name}: {n_events} events, {(~y_tmp['event']).sum()} censored")
+                    
+                    if n_events < 10:
+                        warnings.warn(f"Only {n_events} events in {omic_name}. Model may be unstable.")
+
             groups = outer_groups[X_tmp.index] if outer_groups is not None else None
 
             X_tmp_std = pd.DataFrame(
@@ -227,6 +281,7 @@ def multi_omic_stabl_cv(
                         y=y_tmp,
                         task_type=task_type
                     )
+
 
             if "STABL ALasso" in models:
                 # fit STABL ALasso
@@ -269,6 +324,147 @@ def multi_omic_stabl_cv(
                         y=y_tmp,
                         task_type=task_type
                     )
+
+
+                    # >>> SURVIVAL PATCH: STABL Cox (Train–Validation)
+                        # >>> SURVIVAL PATCH: STABL Cox
+            if "STABL Cox" in models and task_type == "survival":
+                if stabl_cox is None:
+                    raise ValueError("Bạn thêm 'STABL Cox' vào models nhưng chưa khai báo estimators['stabl_cox'].")
+
+                print("Fitting of STABL Cox")
+                stabl_cox.fit(X_tmp_std, y_tmp, groups=groups)
+                tmp_sel_features = list(stabl_cox.get_feature_names_out())
+                fold_selected_features.setdefault("STABL Cox", []).extend(tmp_sel_features)
+                # --- Tạo y_struct cho survival ---
+                y_tmp_struct = Surv.from_arrays(
+                    event=y_tmp["event"].astype(bool).values,
+                    time=y_tmp["time"].astype(float).values
+                )
+
+                # --- Dự báo trên test bằng mô hình CoxPH huấn luyện chỉ trên feature đã chọn ---
+                if len(tmp_sel_features) > 0:
+                    # Bảo đảm cột trùng khớp giữa train/test sau preprocessing
+                    sel_cols = [c for c in tmp_sel_features
+                                if c in X_tmp_std.columns and c in X_test_tmp_std.columns]
+                    if len(sel_cols) == 0:
+                        # Hi hữu: không còn cột trùng -> fallback hằng số
+                        risk_scores = pd.Series(
+                            np.zeros(len(test_idx_tmp)),
+                            index=test_idx_tmp
+                        )
+                    else:
+                        Xtr = X_tmp_std.loc[:, sel_cols]
+                        Xte = X_test_tmp_std.loc[test_idx_tmp, sel_cols]
+
+                        # Final model: CoxPH “mỏng” (ổn khi số feature đã nhỏ)
+                        final_cox = CoxPHSurvivalAnalysis().fit(Xtr.values, y_tmp_struct)
+
+                        # Risk score = Xβ (decision_function), đơn điệu với hazard
+                        risk_scores = pd.Series(
+                            final_cox.predict(Xte.values),
+                            index=test_idx_tmp
+                        )
+                else:
+                    # Không chọn được feature -> fallback 0
+                    risk_scores = pd.Series(np.zeros(len(test_idx_tmp)), index=test_idx_tmp)
+
+                # Lưu risk score vào predictions_dict cho STABL Cox
+                predictions_dict["STABL Cox"].loc[test_idx_tmp, f"Fold n°{k}"] = risk_scores.values
+
+                print(
+                    f"STABL Cox finished on {omic_name} ({X_tmp.shape[0]} samples);"
+                    f" {len(tmp_sel_features)} features selected"
+                )
+                # Lưu FDP+ của fold cho omic hiện tại
+                stabl_features_dict.setdefault("STABL Cox", {}).setdefault(omic_name, pd.DataFrame(columns=["Threshold","min FDP+"]))
+                stabl_features_dict["STABL Cox"][omic_name].loc[f'Fold n°{k}', "min FDP+"] = stabl_cox.min_fdr_
+                stabl_features_dict["STABL Cox"][omic_name].loc[f'Fold n°{k}', "Threshold"] = stabl_cox.fdr_min_threshold_
+
+                
+                save_stabl_results(
+                    stabl=stabl_cox,
+                    path=Path(save_path, "Training CV", f"STABL Cox results on {omic_name} on Fold {k}"),
+                    df_X=X_tmp_std,
+                    y=y_tmp,
+                    task_type=task_type
+                )
+                # ADD THIS BLOCK:
+                import matplotlib.pyplot as plt
+                diagnostic_path = Path(save_path, "Training CV", "STABL Diagnostics")
+                os.makedirs(diagnostic_path, exist_ok=True)
+                
+                try:
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+                    
+                    # Plot 1: Stability paths
+                    n_plot = min(20, stabl_cox.stabl_scores_.shape[0])
+                    max_scores = np.max(stabl_cox.stabl_scores_, axis=1)
+                    top_idx = np.argsort(max_scores)[-n_plot:]
+                    
+                    for idx in top_idx:
+                        ax1.plot(stabl_cox.stabl_scores_[idx, :], alpha=0.5, linewidth=1.5)
+                    ax1.axhline(y=stabl_cox.fdr_min_threshold_, color='r', linestyle='--', 
+                                linewidth=2, label=f'FDR threshold ({stabl_cox.fdr_min_threshold_:.3f})')
+                    ax1.set_xlabel('Lambda iteration')
+                    ax1.set_ylabel('Stability score')
+                    ax1.set_title(f'Stability Paths - Top {n_plot} Features\n{omic_name}')
+                    ax1.legend()
+                    ax1.grid(alpha=0.3)
+                    
+                    # Plot 2: FDR curve
+                    ax2.plot(stabl_cox.fdr_threshold_range, stabl_cox.FDRs_, 'b-', linewidth=2)
+                    ax2.axhline(y=1.0, color='r', linestyle='--', alpha=0.5, label='FDR=1')
+                    ax2.axvline(x=stabl_cox.fdr_min_threshold_, color='g', linestyle='--', 
+                                linewidth=2, label='Selected threshold')
+                    ax2.set_xlabel('Stability threshold')
+                    ax2.set_ylabel('FDR+')
+                    ax2.set_title(f'FDR Control\nMin FDR+: {stabl_cox.min_fdr_:.3f}')
+                    ax2.legend()
+                    ax2.grid(alpha=0.3)
+                    
+                    plt.tight_layout()
+                    plt.savefig(Path(diagnostic_path, f'stability_diagnostics_{omic_name}_fold{k}.pdf'), 
+                                dpi=300, bbox_inches='tight')
+                    plt.close()
+                    
+                    # Feature selection summary
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    n_selected = stabl_cox.get_support().sum()
+                    ax.hist(max_scores, bins=50, alpha=0.7, color='blue', edgecolor='black')
+                    ax.axvline(x=stabl_cox.fdr_min_threshold_, color='r', linestyle='--', 
+                                linewidth=2, label=f'FDR threshold: {stabl_cox.fdr_min_threshold_:.3f}')
+                    ax.set_xlabel('Max Stability Score')
+                    ax.set_ylabel('Number of Features')
+                    ax.set_title(f'Feature Stability Distribution\n{n_selected}/{len(max_scores)} selected')
+                    ax.legend()
+                    ax.grid(alpha=0.3)
+                    
+                    plt.tight_layout()
+                    plt.savefig(Path(diagnostic_path, f'feature_selection_summary_{omic_name}_fold{k}.pdf'), 
+                                dpi=300, bbox_inches='tight')
+                    plt.close()
+                    
+                    # Console summary
+                    print(f"\n  STABL Diagnostics for {omic_name}:")
+                    print(f"    Features selected: {n_selected}/{len(max_scores)}")
+                    print(f"    FDR threshold: {stabl_cox.fdr_min_threshold_:.4f}")
+                    print(f"    Min FDR+: {stabl_cox.min_fdr_:.4f}")
+                    
+                    if n_selected == 0:
+                        warnings.warn(f"No features selected for {omic_name}!")
+                    elif stabl_cox.min_fdr_ > 0.5:
+                        warnings.warn(f"High FDR+ ({stabl_cox.min_fdr_:.3f}) for {omic_name}.")
+                        
+                except Exception as e:
+                    warnings.warn(f"Could not create STABL diagnostic plots: {e}")
+
+            # risk scores cho test
+            # risk_scores = stabl_cox.decision_function(X_test_tmp_std)
+            # predictions_dict.setdefault("STABL Cox", pd.DataFrame(data=None, index=y.index))
+            # predictions_dict["STABL Cox"].loc[test_idx_tmp, f"Fold n°{k}"] = risk_scores
+
+
 
             if "Lasso" in models:
                 # __Lasso__
@@ -350,10 +546,47 @@ def multi_omic_stabl_cv(
                 elif task_type == "regression":
                     predictions = clone(linreg).fit(X_train, y_train).predict(X_test)
 
-                else:
-                    raise ValueError("task_type not recognized.")
+                elif task_type == "survival":
+                    # >>> SURVIVAL PATCH: refit Cox trên features đã chọn
+                    # from sksurv.linear_model import CoxnetSurvivalAnalysis
+                    # from sksurv.util import Surv
+                    # # y_train là Series/DataFrame có 'time','event'
+                    # y_train_df = y_train if isinstance(y_train, pd.DataFrame) else y.loc[y_train.index]
+                    # y_surv_train = Surv.from_arrays(
+                    #     event=y_train_df["event"].astype(bool).to_numpy(),
+                    #     time=y_train_df["time"].to_numpy()
+                    # )
+                    # # Dùng Coxnet đơn giản với 1 alpha cố định (vd. median của alpha_list bạn dùng ở estimator STABL Cox)
+                    # # Nếu có stabl_cox cung cấp lưới alphas, ta lấy median cho consistent:
+                    # # alpha0 = None
+                    # # if stabl_cox is not None and hasattr(stabl_cox, "fitted_lambda_grid_") and "alphas" in stabl_cox.fitted_lambda_grid_:
+                    # #     alist = [float(a[0]) for a in stabl_cox.fitted_lambda_grid_["alphas"]]
+                    # #     alpha0 = np.median(alist)
+                    # # ✅ Better approach: Use the alpha that gave best C-index during STABL
+                    # alpha0 = 1.0  # Default fallback
+                    # if stabl_cox is not None and hasattr(stabl_cox, "fitted_lambda_grid_"):
+                    #     # Get the alpha array
+                    #     if "alphas" in stabl_cox.fitted_lambda_grid_:
+                    #         alpha_array = stabl_cox.fitted_lambda_grid_["alphas"][0]  # First (only) element after fix
+                    #         # Option 1: Use middle value from regularization path
+                    #         alpha0 = alpha_array[len(alpha_array)//2]
+                    #         # Option 2: Store best alpha during STABL and retrieve it
+                    #         # alpha0 = stabl_cox.best_alpha_  # (requires adding this attribute to STABL)
+                    # if alpha0 is None:
+                    #     alpha0 = 1.0
+                    # cox_final = CoxnetSurvivalAnalysis(l1_ratio=1.0, alphas=np.array([alpha0]), max_iter=1_000_000, tol=1e-4)
+                    # cox_final.fit(X_train, y_surv_train)
+                    # predictions = cox_final.predict(X_test)
+                    y_train_struct = Surv.from_arrays(
+                            event=y_train["event"].astype(bool).values,
+                            time=y_train["time"].astype(float).values
+                        )
+                    final_cox = CoxPHSurvivalAnalysis().fit(X_train.values, y_train_struct)
+                    risk = final_cox.predict(X_test.values)
+                    predictions_dict[model].loc[test_idx, f"Fold n°{k}"] = risk
 
-                predictions_dict[model].loc[test_idx, f"Fold n°{k}"] = predictions
+
+                # predictions_dict[model].loc[test_idx, f"Fold n°{k}"] = predictions
 
             else:
                 if task_type == "binary":
@@ -362,8 +595,14 @@ def multi_omic_stabl_cv(
                 elif task_type == "regression":
                     predictions_dict[model].loc[test_idx, f'Fold n°{k}'] = [np.mean(y_train)] * len(test_idx)
 
+                elif task_type == "survival":
+                    # >>> SURVIVAL PATCH: baseline risk score = 0
+                    predictions_dict[model].loc[test_idx, f'Fold n°{k}'] = [0.0] * len(test_idx)
+
                 else:
                     raise ValueError("task_type not recognized.")
+
+
         # __late fusion__
         if late_fusion:
             preds_lf = late_fusion_cv(
@@ -449,7 +688,9 @@ def multi_omic_stabl_cv(
 
     # __SAVING_RESULTS__
     print("Saving results...")
-    if y.name is None:
+    # if y.name is None:
+    #     y.name = "outcome"
+    if isinstance(y, pd.Series) and y.name is None:
         y.name = "outcome"
 
     summary_res_path = Path(save_path, "Summary")
@@ -601,13 +842,25 @@ def multi_omic_stabl(
     if early_fusion:
         models += ["EF " + model for model in models if "STABL" not in model]
 
-    lasso = estimators["lasso"]
-    alasso = estimators["alasso"]
-    en = estimators["en"]
+    # lasso = estimators["lasso"]
+    # alasso = estimators["alasso"]
+    # en = estimators["en"]
 
-    stabl = estimators["stabl_lasso"]
-    stabl_alasso = estimators["stabl_alasso"]
-    stabl_en = estimators["stabl_en"]
+    # stabl = estimators["stabl_lasso"]
+    # stabl_alasso = estimators["stabl_alasso"]
+    # stabl_en = estimators["stabl_en"]
+
+    lasso = estimators.get("lasso")
+    alasso = estimators.get("alasso")
+    en = estimators.get("en")
+
+    stabl = estimators.get("stabl_lasso")
+    stabl_alasso = estimators.get("stabl_alasso")
+    stabl_en = estimators.get("stabl_en")
+
+    # >>> SURVIVAL PATCH: lấy Cox (nếu người dùng có cung cấp)
+    stabl_cox = estimators.get("stabl_cox", None)
+
 
     os.makedirs(Path(save_path, "Training-Validation"), exist_ok=True)
     os.makedirs(Path(save_path, "Summary"), exist_ok=True)
@@ -715,6 +968,38 @@ def multi_omic_stabl(
                 y=y_omic,
                 task_type=task_type
             )
+
+                    # >>> SURVIVAL PATCH: STABL Cox
+                # >>> SURVIVAL PATCH: STABL Cox (Train–Validation)
+        if "STABL Cox" in models and task_type == "survival":
+            if stabl_cox is None:
+                raise ValueError("Bạn thêm 'STABL Cox' vào models nhưng chưa khai báo estimators['stabl_cox'].")
+
+            print(f"Fitting of STABL Cox on {omic_name}")
+            if "STABL Cox" in stabl_params and omic_name in stabl_params["STABL Cox"]:
+                stabl_cox.set_params(lambda_grid=stabl_params["STABL Cox"][omic_name])
+
+            stabl_cox.fit(X_omic_std, y_omic, groups=groups)
+            tmp_sel_features = list(stabl_cox.get_feature_names_out())
+            selected_features_dict.setdefault("STABL Cox", []).extend(tmp_sel_features)
+            print(
+                f"STABL Cox finished on {omic_name} ({X_omic_std.shape[0]} samples);"
+                f" {len(tmp_sel_features)} features selected"
+            )
+            save_stabl_results(
+                stabl=stabl_cox,
+                path=Path(save_path, "Training-Validation", f"STABL Cox results on {omic_name}"),
+                df_X=X_omic,
+                y=y_omic,
+                task_type=task_type
+            )
+
+
+            # risk scores cho test
+            risk_scores = stabl_cox.predict(X_test_tmp_std)
+            predictions_dict.setdefault("STABL Cox", pd.DataFrame(data=None, index=y.index))
+            predictions_dict["STABL Cox"].loc[test_idx_tmp, f"Fold n°{k}"] = risk_scores
+
 
         if "Lasso" in models:
             # __Lasso__
@@ -853,8 +1138,11 @@ def multi_omic_stabl(
             if task_type == "binary":
                 base_linear_model = logit
 
-            else:
+            elif task_type == "regression":
                 base_linear_model = linreg
+
+            elif task_type == "survival":
+                base_linear_model = None
 
             base_linear_model.fit(X_train_std, y)
             base_linear_model_coef = pd.DataFrame(
@@ -872,8 +1160,27 @@ def multi_omic_stabl(
                 )
                 if task_type == "binary":
                     model_preds = base_linear_model.predict_proba(X_test_std)[:, 1]
-                else:
+                elif task_type == "regression":
                     model_preds = base_linear_model.predict(X_test_std)
+                elif task_type == "survival":
+                    from sksurv.linear_model import CoxnetSurvivalAnalysis
+                    from sksurv.util import Surv
+                    y_surv_train = Surv.from_arrays(
+                        event=y["event"].astype(bool).to_numpy(),
+                        time=y["time"].to_numpy()
+                    )
+                    # chọn alpha tương tự như phần CV: median alpha của STABL Cox nếu có; else 1.0
+                    alpha0 = None
+                    if stabl_cox is not None and hasattr(stabl_cox, "fitted_lambda_grid_") and "alphas" in stabl_cox.fitted_lambda_grid_:
+                        alist = [float(a[0]) for a in stabl_cox.fitted_lambda_grid_["alphas"]]
+                        alpha0 = np.median(alist)
+                    if alpha0 is None:
+                        alpha0 = 1.0
+                    cox_final = CoxnetSurvivalAnalysis(l1_ratio=1.0, alphas=np.array([alpha0]), max_iter=1_000_000, tol=1e-4)
+                    # Fit trên X_train_std (đã chuẩn hóa) với features đã chọn
+                    cox_final.fit(X_train_std, y_surv_train)
+                    model_preds = cox_final.predict(X_test_std)
+
         else:
             if X_test is not None:
                 model_preds = np.zeros(X_test_tot.shape[0])
@@ -881,6 +1188,9 @@ def multi_omic_stabl(
                     model_preds[:] = 0.5
                 elif task_type == "regression":
                     model_preds[:] = np.mean(y)
+                elif task_type == "survival":
+                    model_preds[:] = 0.0
+
         if X_test is not None:
             predictions_dict[model] = pd.Series(
                 model_preds,
