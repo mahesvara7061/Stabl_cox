@@ -184,6 +184,8 @@ def multi_omic_stabl_cv(
         predictions_dict[model] = pd.DataFrame(data=None, index=y.index)
         selected_features_dict[model] = []
         stabl_features_dict[model] = dict()
+        sample_tracking_all_folds = []
+        feature_selection_info = {}
         for omic_name in data_dict.keys():
             if "STABL" in model:
                 stabl_features_dict[model][omic_name] = pd.DataFrame(data=None, columns=["Threshold", "min FDP+"])
@@ -215,6 +217,34 @@ def multi_omic_stabl_cv(
             # Preprocessing of X_tmp
             X_tmp = remove_low_info_samples(X_tmp)
             y_tmp = y.loc[X_tmp.index]
+            # COPY-PASTE THIS ENTIRE BLOCK:
+            # ════════════════════════════════════════════════════════════════
+            # Track samples for this fold
+            train_info = pd.DataFrame({
+                'fold': k, 'omic': omic_name, 'split': 'train',
+                'sample_id': X_tmp.index.tolist(),
+            })
+            test_info = pd.DataFrame({
+                'fold': k, 'omic': omic_name, 'split': 'test',
+                'sample_id': test_idx_tmp.tolist(),
+            })
+
+            if task_type == "survival":
+                train_info['time'] = y_tmp['time'].values
+                train_info['event'] = y_tmp['event'].values
+                test_info['time'] = y.loc[test_idx_tmp]['time'].values
+                test_info['event'] = y.loc[test_idx_tmp]['event'].values
+
+            fold_samples = pd.concat([train_info, test_info], ignore_index=True)
+            sample_tracking_all_folds.append(fold_samples)
+
+            # Save incrementally
+            os.makedirs(Path(save_path, "Sample_Tracking"), exist_ok=True)
+            fold_samples.to_csv(
+                Path(save_path, "Sample_Tracking", f"fold{k}_{omic_name}_samples.csv"),
+                index=False
+            )
+            # ════════════════════════════════════════════════════════════════
 
             # ADD THIS BLOCK:
             if task_type == "survival":
@@ -746,6 +776,36 @@ def multi_omic_stabl_cv(
         task_type=task_type,
         save_path=cv_res_path
     )
+
+    # COPY-PASTE THIS ENTIRE BLOCK:
+    # ════════════════════════════════════════════════════════════════
+    # Create sample tracking summaries
+    if sample_tracking_all_folds:
+        sample_tracking_path = Path(save_path, "Sample_Tracking")
+        
+        # All samples
+        all_samples = pd.concat(sample_tracking_all_folds, ignore_index=True)
+        all_samples.to_csv(sample_tracking_path / "all_folds_all_samples.csv", index=False)
+        
+        # Sample frequency
+        train_samples = all_samples[all_samples['split'] == 'train']
+        freq = train_samples.groupby('sample_id').size().reset_index(name='times_in_training')
+        total_folds = all_samples['fold'].nunique()
+        freq['percentage'] = (freq['times_in_training'] / total_folds * 100).round(2)
+        freq.to_csv(sample_tracking_path / "sample_frequency_in_training.csv", index=False)
+        
+        # Fold summary
+        summary = all_samples.groupby(['fold', 'omic', 'split']).agg({
+            'sample_id': 'count'
+        }).reset_index()
+        summary.columns = ['fold', 'omic', 'split', 'n_samples']
+        if task_type == "survival":
+            events = all_samples.groupby(['fold', 'omic', 'split'])['event'].sum().reset_index()
+            summary = summary.merge(events, on=['fold', 'omic', 'split'])
+        summary.to_csv(sample_tracking_path / "fold_summary_statistics.csv", index=False)
+        
+        print(f"[INFO] Sample tracking saved: {sample_tracking_path}")
+    # ════════════════════════════════════════════════════════════════
 
     return predictions_dict
 
