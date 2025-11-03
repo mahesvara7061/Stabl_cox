@@ -760,3 +760,49 @@ def _is_categorical(df, feature, categorical_features):
     if isinstance(categorical_features, int) and df[feature].nunique() <= categorical_features:
         return True
     return False
+
+def plot_kaplan_meier(y, predictions, risk_groups=2, show_fig=True, export_file=False, path=None):
+    """
+    Plot Kaplan-Meier survival curves stratified by risk groups.
+    
+    Parameters
+    ----------
+    y : pd.DataFrame
+        Survival data with 'time' and 'event' columns
+    predictions : pd.Series
+        Risk scores/predictions
+    risk_groups : int, default=2
+        Number of risk groups to create (e.g., high/low risk)
+    """
+    from sksurv.nonparametric import kaplan_meier_estimator
+    import matplotlib.pyplot as plt
+    
+    # Create risk groups
+    quantiles = np.linspace(0, 1, risk_groups + 1)
+    thresholds = np.quantile(predictions, quantiles)
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    for i in range(risk_groups):
+        mask = (predictions >= thresholds[i]) & (predictions < thresholds[i+1])
+        y_group = y[mask]
+        
+        time, survival = kaplan_meier_estimator(
+            y_group['event'].astype(bool),
+            y_group['time']
+        )
+        
+        ax.step(time, survival, where='post', label=f'Risk Group {i+1}')
+    
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Survival Probability')
+    ax.set_title('Kaplan-Meier Survival Curves')
+    ax.legend()
+    ax.grid(alpha=0.3)
+    
+    if export_file and path:
+        fig.savefig(path, dpi=300, bbox_inches='tight')
+    if not show_fig:
+        plt.close()
+    
+    return fig, ax
