@@ -10,6 +10,10 @@ from .visualization import scatterplot_regression_predictions, boxplot_binary_pr
 from .metrics import jaccard_matrix
 from sklearn.metrics import roc_auc_score, average_precision_score, r2_score, mean_squared_error, mean_absolute_error
 
+# >>> SURVIVAL PATCH: imports
+from sksurv.metrics import concordance_index_censored
+
+
 from scipy import stats
 from scipy.stats import mannwhitneyu
 from sklearn.model_selection import GridSearchCV
@@ -84,6 +88,9 @@ def save_plots(predictions_dict, y, task_type, save_path):
                 paths=os.path.join(saving_path, f"{name} Scatter-plot of median predictions.pdf")
             )
 
+        elif task_type == "survival":
+            continue
+
 
 def compute_scores_table(
         predictions_dict,
@@ -130,6 +137,12 @@ def compute_scores_table(
         elif task_type == "regression":
             scores_columns = ["R2", "RMSE", "MAE"]
 
+    if task_type == "survival":
+        if selected_features_dict is not None:
+            scores_columns = ["C-index", "N features", "CVS"]
+        else:
+            scores_columns = ["C-index"]
+
     table_of_scores = pd.DataFrame(data=None, columns=scores_columns)
 
     for model, preds in predictions_dict.items():
@@ -174,6 +187,16 @@ def compute_scores_table(
                 model_mae = mean_absolute_error(y, preds)
                 model_mae_CI = compute_CI(y, preds, scoring="mae")
                 cell_value = f"{model_mae:.3f} [{model_mae_CI[0]:.3f}, {model_mae_CI[1]:.3f}]"
+
+            elif metric == "C-index":
+                y_aligned = y.loc[preds.index]
+                ev = y_aligned["event"].astype(bool).to_numpy()
+                tt = y_aligned["time"].to_numpy()
+                cidx_result = concordance_index_censored(ev, tt, preds.to_numpy())
+                cidx = cidx_result[0]
+                # Could add bootstrapped CI here
+                cell_value = f"{cidx:.3f}"
+
             else:
                 raise ValueError(f"Metric not recognized.")
 
@@ -225,6 +248,12 @@ def compute_pvalues_table(
             scores_columns = ["ROC AUC", "Average Precision"]
 
         elif task_type == "regression":
+            scores_columns = ["Prediction"]
+
+    if task_type == "survival":
+        if selected_features_dict is not None:
+            scores_columns = ["Prediction", "N features", "CVS"]
+        else:
             scores_columns = ["Prediction"]
 
     p_values_dict = {
