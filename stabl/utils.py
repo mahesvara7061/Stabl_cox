@@ -7,6 +7,10 @@ from sklearn.model_selection import RepeatedKFold, cross_val_predict, \
     ParameterGrid, LeaveOneOut
 from sklearn.base import clone
 from sklearn.svm import l1_min_c
+# >>> SURVIVAL PATCH: imports
+from sksurv.metrics import concordance_index_censored
+from sksurv.linear_model import CoxnetSurvivalAnalysis
+
 
 
 def auto_mode_lambda_grid(X, y, task_type, l1_ratio=None, n_lambda=30):
@@ -40,6 +44,20 @@ def auto_mode_lambda_grid(X, y, task_type, l1_ratio=None, n_lambda=30):
         if task_type == "classification":
             min_C = l1_min_c(X, y, loss="log")
             params = {"C": np.linspace(min_C, min_C * 100, n_lambda)}
+        elif task_type == "survival":
+            # For CoxnetSurvivalAnalysis
+            # Ensure y is a structured array for sksurv
+            if isinstance(y, pd.DataFrame):
+                y_sksurv = np.empty(len(y), dtype=[('event', bool), ('time', float)])
+                y_sksurv['event'] = y['event'].astype(bool)
+                y_sksurv['time'] = y['time']
+            else:
+                y_sksurv = y
+
+            cox = CoxnetSurvivalAnalysis(n_alphas=n_lambda, l1_ratio=l1_r, fit_baseline_model=True)
+            cox.fit(X, y_sksurv)
+            # params = {"alphas": [cox.alphas_]}
+            params = {"alphas": [[a] for a in cox.alphas_]}
         else:
             l_max = np.linalg.norm(X.T @ y, np.inf) / (X.shape[0] * l1_r)
             params = {"alpha": np.geomspace(l_max / 30, l_max + 5, n_lambda)}
@@ -106,8 +124,10 @@ def fit_predict(estimator, X, y, train, test, task_type):
         results[test] = estimator.fit(X[train], y[train]).predict_proba(X[test])
     elif task_type == "regression":
         results[test] = estimator.fit(X[train], y[train]).predict(X[test])
+    elif task_type == "survival":
+        results[test] = estimator.fit(X[train], y[train]).predict(X[test])
     else:
-        raise ValueError(f"Task type should be in ['binary' ,'multiclass', 'regression']. Got {task_type}")
+        raise ValueError(f"Task type should be in ['binary' ,'multiclass', 'regression', 'survival']. Got {task_type}")
 
     return results
 
@@ -243,6 +263,16 @@ def nonpartition_gridsearch(
             score = roc_auc_score(y, y_preds, multi_class="ovr")
         elif task_type == "regression":
             score = r2_score(y, y_preds)
+        elif task_type == "survival":
+            # y phải align với y_preds; concordance_index_censored nhận (event, time, estimate)
+            if isinstance(y, (pd.Series, pd.DataFrame)):
+                ev = y["event"].astype(bool).to_numpy()
+                tt = y["time"].to_numpy()
+            else:
+                # structured array Surv
+                ev = y["event"].astype(bool)
+                tt = y["time"]
+            score = concordance_index_censored(ev, tt, np.asarray(y_preds))[0]
         else:
             raise ValueError(f"`task_type` should be in ['binary', 'multiclass', 'regression']. Got {task_type}")
 
@@ -331,6 +361,27 @@ def loo_gridsearch(
                 method="predict_proba"
             )
             score = roc_auc_score(y, y_preds, multi_class="ovr")
+
+        elif task_type == "survival":
+            # y có thể là DataFrame (time,event) hoặc structured Surv
+            # ta sẽ tự chạy predict theo từng split, ghép lại và chấm C-index
+            if isinstance(y, (pd.Series, pd.DataFrame)):
+                y_df = y.copy()
+            else:
+                # convert structured Surv -> DataFrame để dễ thao tác
+                y_df = pd.DataFrame({"time": y["time"], "event": y["event"].astype(bool)})
+
+            y_preds = np.full(len(y_df), np.nan, dtype=float)
+            X_np = X if isinstance(X, np.ndarray) else np.asarray(X)
+
+            for train_idx, test_idx in cv.split(X_np, groups=groups):
+                est = clone(estimator)
+                est.fit(X_np[train_idx], y_df.iloc[train_idx].to_records(index=False))
+                y_preds[test_idx] = est.predict(X_np[test_idx])
+
+            ev = y_df["event"].astype(bool).to_numpy()
+            tt = y_df["time"].to_numpy()
+            score = concordance_index_censored(ev, tt, y_preds)[0]
 
         else:
             raise ValueError(f"Task type is invalid, it should be in ['binary', 'multiclass', 'regression']. "
