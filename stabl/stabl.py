@@ -15,6 +15,8 @@ from sklearn.model_selection import ParameterGrid,  GroupShuffleSplit
 from sklearn.utils import safe_mask
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.utils.validation import _check_feature_names_in, check_is_fitted
+from sksurv.linear_model import CoxPHSurvivalAnalysis
+from sksurv.util import Surv
 from tqdm.autonotebook import tqdm
 from .unionfind import UnionFind
 import warnings
@@ -22,7 +24,7 @@ from .utils import auto_mode_lambda_grid
 from .visualization import boxplot_features, scatterplot_features
 
 
-def classic_bootstrap(y, n_subsamples, replace=True, class_weight=None, rng=np.random.default_rng(None), **kwargs):
+def classic_bootstrap(y, n_subsamples, replace=True, class_weight=None, rng=np.random.default_rng(None), task_type="binary", **kwargs):
     """Function to create a bootstrap sample from the original dataset.
     Weights can be used to make some samples more likely to be selected.
 
@@ -77,14 +79,33 @@ def classic_bootstrap(y, n_subsamples, replace=True, class_weight=None, rng=np.r
         p=sampling_probs
     )
 
+
     # Handling the case of binary classification where we only select one class
-    if len(np.unique(y[sampled_indices])) < 2:
+    # REPLACE lines 82-91 with:
+    # Task-specific validation
+    needs_resample = False
+    
+    if task_type == "binary":
+        if len(np.unique(y[sampled_indices])) < 2:
+            needs_resample = True
+            
+    elif task_type == "survival":
+        # Extract event status
+        if isinstance(y, pd.DataFrame):
+            y_events = y.iloc[sampled_indices]["event"].values
+        elif hasattr(y, 'dtype') and hasattr(y.dtype, 'names'):
+            event_field = 'event' if 'event' in y.dtype.names else y.dtype.names[1]
+            y_events = y[event_field][sampled_indices]
+        else:
+            y_events = y[sampled_indices] if y.ndim == 1 else y[sampled_indices, 1]
+        
+        if len(np.unique(y_events)) < 2:
+            needs_resample = True
+    
+    if needs_resample:
         sampled_indices = classic_bootstrap(
-            y,
-            n_subsamples,
-            replace=replace,
-            class_weight=class_weight,
-            rng=rng
+            y, n_subsamples, replace=replace, class_weight=class_weight,
+            rng=rng, task_type=task_type, **kwargs
         )
 
     return sampled_indices
@@ -155,6 +176,7 @@ def _bootstrap_generator(
         n_subsamples,
         replace,
         random_state=None,
+        task_type="binary",
         **kwargs
 ):
     """Function that creates bootstrapped indices, used in the Stabl process.
@@ -365,16 +387,72 @@ def plot_fdr_graph_table(
 
     check_is_fitted(stabl, 'stabl_scores_')
 
+    # def dict_format(d, form="{:6.3f}"):
+    #     if not isinstance(form, dict):
+    #         form = {k: form for k in d.keys()}
+    #     res = "{"
+    #     for k, v in d.items():
+    #         res += k + ":" + form[k].format(v)
+    #         res += ", "
+    #     res = res[:-2]
+    #     res += "}"
+    #     return res
     def dict_format(d, form="{:6.3f}"):
+        """
+        Robust formatting for dict entries in lambda_grid.
+        - Scalars are formatted with `form` (or per-key dict of forms).
+        - Arrays/lists are summarized compactly.
+        """
+        import numpy as _np
+
+        # Chuẩn hóa form
         if not isinstance(form, dict):
             form = {k: form for k in d.keys()}
-        res = "{"
+
+        parts = []
         for k, v in d.items():
-            res += k + ":" + form[k].format(v)
-            res += ", "
-        res = res[:-2]
-        res += "}"
-        return res
+            fmt = form.get(k, "{:6.3f}")
+
+            # scalar?
+            if _np.isscalar(v):
+                try:
+                    val_str = fmt.format(float(v))
+                except Exception:
+                    val_str = str(v)
+
+            # list/tuple/array?
+            elif isinstance(v, (list, tuple, _np.ndarray)):
+                arr = _np.asarray(v).ravel()
+                if arr.size == 0:
+                    val_str = "[]"
+                elif arr.size <= 5:
+                    vals = []
+                    for x in arr:
+                        try:
+                            vals.append("{:.3f}".format(float(x)))
+                        except Exception:
+                            vals.append(str(x))
+                    val_str = "[" + ", ".join(vals) + "]"
+                else:
+                    head = []
+                    for x in arr[:3]:
+                        try:
+                            head.append("{:.3f}".format(float(x)))
+                        except Exception:
+                            head.append(str(x))
+                    try:
+                        tail = "{:.3f}".format(float(arr[-1]))
+                    except Exception:
+                        tail = str(arr[-1])
+                    val_str = "[" + ", ".join(head) + ", ..., " + tail + "]"
+            else:
+                # fallback chuỗi
+                val_str = str(v)
+
+            parts.append(f"{k}:{val_str}")
+
+        return "{" + ", ".join(parts) + "}"
+
 
     fig, ax = plt.subplots(1, 1, figsize=figsize)
 
@@ -486,6 +564,16 @@ def plot_stabl_path(
             order_list = [np.arange(len(stabl.fitted_lambda_grid_["C"]))]
             x_grid_list = [x_grid_tmp]
             x_padding_list = [0]
+        elif 'alphas' in stabl.fitted_lambda_grid_:
+            # >>> SURVIVAL PATCH: plot path for 'alphas'
+            # fitted_lambda_grid_['alphas'] là list các np.array([alpha])
+            alphas_scalar = np.array([float(a[0]) for a in stabl.fitted_lambda_grid_["alphas"]])
+            # làm giống cách chuẩn hóa trục như case 'alpha'
+            x_grid_tmp = np.min(alphas_scalar) / alphas_scalar
+            order_list = [np.arange(len(alphas_scalar))]
+            x_grid_list = [x_grid_tmp]
+            x_padding_list = [0]
+
     elif nb_different_params == 2:
         params = list(ParameterGrid(stabl.fitted_lambda_grid_))
         ordered_params = dict()
@@ -734,6 +822,62 @@ def save_stabl_results(
         )
 
 
+# def fit_bootstrapped_sample(
+#         base_estimator,
+#         X,
+#         y,
+#         lambda_val,
+#         corr_groups=None,
+#         threshold=None
+# ):
+#     """
+#     Fits base_estimator on a bootstrap sample of the original data,
+#     and returns a mas of the variables that are selected by the fitted model.
+
+#     Parameters
+#     ----------
+#     base_estimator: estimator
+#         This is the estimator to be fitted on the data
+
+#     X: {array-like, sparse matrix}, shape = [n_repeats, n_features]
+#         The training input samples.
+
+#     y: array-like, shape = [n_repeats]
+#         The target values.
+
+#     lambda_val: dict of parameters
+#         Penalization parameters of base_estimator
+
+#     corr_groups: array-like, default=None
+#         Groups of features based on the correlation matrix. It is used for sparse group lasso.
+
+#     threshold: string or float, default=None
+#         The hard_threshold value to use for feature selection. Features whose
+#         importance is greater or equal are kept while the others are
+#         discarded. If "median" (resp. "mean"), then the ``hard_threshold`` value is
+#         the median (resp. the mean) of the feature importance. A scaling
+#         factor (e.g., "1.25*mean") may also be used. If None and if the
+#         estimator has a parameter penalty set to l1, either explicitly
+#         or implicitly (e.g, Lasso), the hard_threshold used is 1e-5.
+#         Otherwise, "mean" is used by default.
+
+#     Returns
+#     -------
+#     selected_variables: array-like, shape=(n_features, )
+#         Boolean mask of the selected variables.
+#     """
+#     base_estimator.set_params(**lambda_val)
+#     if hasattr(base_estimator, "groups"):
+#         base_estimator.set_params(groups=corr_groups)
+#     base_estimator.fit(X, y)
+
+#     features_selection = SelectFromModel(
+#         estimator=base_estimator,
+#         threshold=threshold,
+#         prefit=True
+#     )
+
+#     return features_selection.get_support()
 def fit_bootstrapped_sample(
         base_estimator,
         X,
@@ -744,52 +888,55 @@ def fit_bootstrapped_sample(
 ):
     """
     Fits base_estimator on a bootstrap sample of the original data,
-    and returns a mas of the variables that are selected by the fitted model.
-
-    Parameters
-    ----------
-    base_estimator: estimator
-        This is the estimator to be fitted on the data
-
-    X: {array-like, sparse matrix}, shape = [n_repeats, n_features]
-        The training input samples.
-
-    y: array-like, shape = [n_repeats]
-        The target values.
-
-    lambda_val: dict of parameters
-        Penalization parameters of base_estimator
-
-    corr_groups: array-like, default=None
-        Groups of features based on the correlation matrix. It is used for sparse group lasso.
-
-    threshold: string or float, default=None
-        The hard_threshold value to use for feature selection. Features whose
-        importance is greater or equal are kept while the others are
-        discarded. If "median" (resp. "mean"), then the ``hard_threshold`` value is
-        the median (resp. the mean) of the feature importance. A scaling
-        factor (e.g., "1.25*mean") may also be used. If None and if the
-        estimator has a parameter penalty set to l1, either explicitly
-        or implicitly (e.g, Lasso), the hard_threshold used is 1e-5.
-        Otherwise, "mean" is used by default.
-
-    Returns
-    -------
-    selected_variables: array-like, shape=(n_features, )
-        Boolean mask of the selected variables.
+    and returns a mask of the variables that are selected by the fitted model.
+    Now robust to cases where SelectFromModel/support length mismatches X.
     """
+    # Set hyperparams for this bootstrap
     base_estimator.set_params(**lambda_val)
     if hasattr(base_estimator, "groups"):
         base_estimator.set_params(groups=corr_groups)
+
+    # Fit on the (subsampled) data
     base_estimator.fit(X, y)
 
-    features_selection = SelectFromModel(
-        estimator=base_estimator,
-        threshold=threshold,
-        prefit=True
-    )
+    n_features = X.shape[1]
 
-    return features_selection.get_support()
+    # --- Try the usual SelectFromModel path ---
+    try:
+        features_selection = SelectFromModel(
+            estimator=base_estimator,
+            threshold=threshold,
+            prefit=True
+        )
+        support = features_selection.get_support()
+        if support.shape[0] == n_features:
+            return support
+        # nếu chiều lệch, rơi xuống fallback
+        raise RuntimeError("support length mismatch")
+    except Exception:
+        # --- Fallback: tự dựng mask từ coef_/feature_importances_ rồi ép chiều ---
+        coef = None
+        if hasattr(base_estimator, "coef_") and base_estimator.coef_ is not None:
+            coef = np.ravel(base_estimator.coef_)
+        elif hasattr(base_estimator, "feature_importances_"):
+            coef = np.ravel(base_estimator.feature_importances_)
+
+        if coef is None:
+            # Bó tay: chọn none để không làm vstack lỗi
+            return np.zeros(n_features, dtype=bool)
+
+        # Ép chiều: pad nếu thiếu, cắt nếu thừa
+        if coef.shape[0] < n_features:
+            coef = np.pad(coef, (0, n_features - coef.shape[0]))
+        elif coef.shape[0] > n_features:
+            coef = coef[:n_features]
+
+        # Ngưỡng: nếu threshold là số, dùng luôn; nếu không, dùng ngưỡng nhỏ
+        # (tránh all-zero do regularization quá mạnh)
+        thr = float(threshold) if isinstance(threshold, (int, float)) else 1e-12
+        support = np.abs(coef) > thr
+        return support
+
 
 
 class Stabl(SelectorMixin, BaseEstimator):
@@ -944,7 +1091,8 @@ class Stabl(SelectorMixin, BaseEstimator):
             sgl_groups=None,
             verbose=0,
             n_jobs=-1,
-            random_state=None
+            random_state=None,
+            task_type="binary"
     ):
         if fdr_threshold_range is None:
             fdr_threshold_range = np.arange(0., 1., .01)
@@ -978,6 +1126,108 @@ class Stabl(SelectorMixin, BaseEstimator):
         self.fdr_min_threshold_ = None
         self.explore_threshold = None
         self.fitted_lambda_grid_ = None
+        self.task_type = task_type
+
+
+        # --- Polyfill cho sklearn cũ: _validate_data ---
+    # def _validate_data(self, X, y=None, reset=True, validate_separately=False):
+    #     """
+    #     Polyfill tối giản thay cho sklearn.BaseEstimator._validate_data.
+    #     - Chấp nhận X là DataFrame hoặc ndarray; ép về float (cho phép NaN).
+    #     - Nếu reset=True, thiết lập n_features_in_ và feature_names_in_ (nếu có).
+    #     - Nếu y is None -> trả về X
+    #       Nếu y không None -> trả về (X, y)
+    #     """
+    #     # Chuẩn hoá X
+    #     if isinstance(X, pd.DataFrame):
+    #         X_arr = X.to_numpy(dtype=float, copy=False)
+    #         if reset:
+    #             self.n_features_in_ = X_arr.shape[1]
+    #             # Lưu tên cột nếu đều là string
+    #             if all(isinstance(c, str) for c in X.columns):
+    #                 self.feature_names_in_ = np.array(X.columns, dtype=object)
+    #     else:
+    #         X_arr = np.asarray(X, dtype=float)
+    #         if reset:
+    #             self.n_features_in_ = X_arr.shape[1]
+
+    #     # Chuẩn hoá y (cho phép Series / ndarray / structured array cho survival)
+    #     if y is None:
+    #         return X_arr
+    #     else:
+    #         if isinstance(y, pd.Series):
+    #             y_arr = y.values
+    #         else:
+    #             y_arr = np.asarray(y)
+    #         return X_arr, y_arr
+    def _validate_data(self, X, y=None, reset=True, validate_separately=False):
+        # ---- X: giữ nguyên như trước ----
+        if isinstance(X, pd.DataFrame):
+            X_arr = X.to_numpy(dtype=float, copy=False)
+            if reset:
+                self.n_features_in_ = X_arr.shape[1]
+                if all(isinstance(c, str) for c in X.columns):
+                    self.feature_names_in_ = np.array(X.columns, dtype=object)
+        else:
+            X_arr = np.asarray(X, dtype=float)
+            if reset:
+                self.n_features_in_ = X_arr.shape[1]
+
+        # ---- y: bổ sung nhận diện SURVIVAL và convert structured array ----
+        if y is None:
+            return X_arr
+
+        # Nếu là pandas DataFrame 2 cột (time, event) hoặc (event, time)
+        if isinstance(y, pd.DataFrame):
+            cols = [c.strip().lower() for c in y.columns]
+            # các tên hay gặp
+            event_alias = {"event", "status", "censor", "censored", "observed", "dead"}
+            time_alias  = {"time", "os", "survival", "overall_survival", "duration"}
+
+            # tìm cột event/time
+            ev_col = next((c for c in y.columns if c.strip().lower() in event_alias), None)
+            tm_col = next((c for c in y.columns if c.strip().lower() in time_alias), None)
+
+            if ev_col is not None and tm_col is not None:
+                event = pd.to_numeric(y[ev_col], errors="coerce")
+                # quy ước của bạn: 1 = dead/event, 0 = alive/censored
+                event = (event == 1).astype(bool).values
+                time  = pd.to_numeric(y[tm_col], errors="coerce").astype(float).values
+                # drop NaN hàng nào có thiếu
+                mask = ~np.isnan(time)
+                event = event[mask]
+                time  = time[mask]
+                y_arr = np.array(list(zip(event, time)),
+                                 dtype=[('event', '?'), ('time', '<f8')])
+                return X_arr, y_arr
+
+        # Nếu là numpy 2D (n,2), cố gắng suy đoán theo thứ tự (event, time)
+        y_np = np.asarray(y)
+        if y_np.ndim == 2 and y_np.shape[1] == 2:
+            # Cột event: ép về bool với quy ước 1=event, 0=censored
+            ev_raw = pd.to_numeric(y_np[:, 0], errors="coerce")
+            event = (ev_raw == 1).astype(bool)
+            time  = pd.to_numeric(y_np[:, 1], errors="coerce").astype(float)
+            # mask = ~np.isnan(time)
+            # event = event[mask]
+            # time  = time[mask]
+            # y_arr = np.array(list(zip(event, time)),
+            #                  dtype=[('event', '?'), ('time', '<f8')])
+            # return X_arr, y_arr
+            mask = ~np.isnan(time) & ~np.isnan(event)
+            n_dropped = len(time) - mask.sum()
+            if n_dropped > 0:
+                warnings.warn(f"Dropped {n_dropped} samples with NaN. Remaining: {mask.sum()}", UserWarning)
+            event = event[mask]
+            time = time[mask]
+            X_arr = X_arr[mask]  # ✅ Critical: Also filter X
+            y_arr = np.array(list(zip(event, time)), dtype=[('event', '?'), ('time', '<f8')])
+            return X_arr, y_arr
+
+        # Còn lại: cứ trả về như cũ (classification/regression)
+        return X_arr, y_np
+
+
 
     def _check_lambda_grid(self):
         """Check if the lambda_grid is valid. Raise error if not.
@@ -1132,6 +1382,30 @@ class Stabl(SelectorMixin, BaseEstimator):
             validate_separately=False
         )
 
+                # >>> SURVIVAL PATCH: build y_surv
+        y_surv = None
+        # if self.task_type == "survival":
+        #     # Chấp nhận y là DataFrame/Series có cột 'time' và 'event'
+        #     if isinstance(y, (pd.Series, pd.DataFrame)):
+        #         # Series 2-cột thì y[['time','event']], Series đơn cột thì y.to_frame()
+        #         if isinstance(y, pd.Series):
+        #             y = y.to_frame()
+        #         time = y["time"].to_numpy()
+        #         event = y["event"].astype(bool).to_numpy()
+        #     else:
+        #         # Hoặc mảng 2 cột: [:,0]=time, [:,1]=event
+        #         y = np.asarray(y)
+        #         time = y[:, 0]
+        #         event = y[:, 1].astype(bool)
+        #     y_surv = Surv.from_arrays(event=event, time=time)
+        # SIMPLIFIED
+        if self.task_type == "survival":
+            if isinstance(y, np.ndarray) and hasattr(y.dtype, 'names') and y.dtype.names == ('event', 'time'):
+                y_surv = y  # Already in correct format from _validate_data
+            else:
+                raise ValueError("For survival, y must be convertible to structured array")
+
+
         n_samples, n_features = X.shape
         n_subsamples = int(np.floor(self.sample_fraction * n_samples))
         self.fitted_lambda_grid_ = self._get_optimized_lambda_grid(X, y)
@@ -1163,6 +1437,7 @@ class Stabl(SelectorMixin, BaseEstimator):
             corr_groups = self._make_groups(X)
 
         # Generating the bootstrap indices
+        # Line 1305 - ADD task_type argument
         bootstrap_indices = _bootstrap_generator(
             n_bootstraps=self.n_bootstraps,
             bootstrap_func=self.bootstrap_func,
@@ -1171,7 +1446,8 @@ class Stabl(SelectorMixin, BaseEstimator):
             replace=self.replace,
             groups=groups,
             class_weight=self.sample_weight_bootstrap,
-            random_state=self.random_state
+            random_state=self.random_state,
+            task_type=self.task_type  # ← ADD THIS LINE
         )
 
         # --Loop--
@@ -1186,20 +1462,54 @@ class Stabl(SelectorMixin, BaseEstimator):
                 disable=(not leave)
         ):
             # Computing the frequencies
-            selected_variables = Parallel(
-                n_jobs=self.n_jobs,
-                verbose=0,
-                pre_dispatch='2*n_jobs'
-            )(delayed(fit_bootstrapped_sample)(
-                clone(base_estimator),
-                X=X[safe_mask(X, subsample_indices), :],
-                y=y[subsample_indices],
-                corr_groups=corr_groups,
-                lambda_val=lambda_val,
-                threshold=self.bootstrap_threshold
-            )
-                for subsample_indices in bootstrap_indices
-            )
+            # selected_variables = Parallel(
+            #     n_jobs=self.n_jobs,
+            #     verbose=0,
+            #     pre_dispatch='2*n_jobs'
+            # )(delayed(fit_bootstrapped_sample)(
+            #     clone(base_estimator),
+            #     X=X[safe_mask(X, subsample_indices), :],
+            #     y=y[subsample_indices],
+            #     corr_groups=corr_groups,
+            #     lambda_val=lambda_val,
+            #     threshold=self.bootstrap_threshold
+            # )
+            #     for subsample_indices in bootstrap_indices
+            # )
+                        # >>> SURVIVAL PATCH: selected_variables loop
+            if self.task_type == "survival":
+                # Dùng y_surv (structured array) cho Cox
+                selected_variables = Parallel(
+                    n_jobs=self.n_jobs,
+                    verbose=0,
+                    pre_dispatch='2*n_jobs'
+                )(delayed(fit_bootstrapped_sample)(
+                    clone(base_estimator),
+                    X=X[safe_mask(X, subsample_indices), :],
+                    y=y_surv[subsample_indices],   # <<--- dùng y_surv
+                    corr_groups=corr_groups,
+                    lambda_val=lambda_val,
+                    threshold=self.bootstrap_threshold
+                )
+                    for subsample_indices in bootstrap_indices
+                )
+            else:
+                # Nhánh cũ cho binary/multiclass/regression
+                selected_variables = Parallel(
+                    n_jobs=self.n_jobs,
+                    verbose=0,
+                    pre_dispatch='2*n_jobs'
+                )(delayed(fit_bootstrapped_sample)(
+                    clone(base_estimator),
+                    X=X[safe_mask(X, subsample_indices), :],
+                    y=y[subsample_indices],
+                    corr_groups=corr_groups,
+                    lambda_val=lambda_val,
+                    threshold=self.bootstrap_threshold
+                )
+                    for subsample_indices in bootstrap_indices
+                )
+
 
             if self.artificial_type is not None:
                 self.stabl_scores_artificial_[:, idx] = np.vstack(

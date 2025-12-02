@@ -26,7 +26,7 @@ import warnings
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.utils._testing import ignore_warnings
 from sksurv.util import Surv
-from sksurv.linear_model import CoxPHSurvivalAnalysis
+from sksurv.linear_model import CoxnetSurvivalAnalysis
 
 
 warnings.filterwarnings('ignore')
@@ -217,9 +217,9 @@ def multi_omic_stabl_cv(
     stabl_cox = estimators.get("stabl_cox", None)
 
     if task_type == "survival" and stabl_cox is not None:
-        from sksurv.linear_model import CoxPHSurvivalAnalysis
-        if not isinstance(stabl_cox.base_estimator, CoxPHSurvivalAnalysis):
-            warnings.warn("For survival, base_estimator should be CoxPHSurvivalAnalysis (Ridge regularization)")
+        from sksurv.linear_model import CoxnetSurvivalAnalysis
+        if not isinstance(stabl_cox.base_estimator, CoxnetSurvivalAnalysis):
+            warnings.warn("For survival, base_estimator should be CoxnetSurvivalAnalysis")
 
     os.makedirs(Path(save_path, "Training CV"), exist_ok=True)
     os.makedirs(Path(save_path, "Summary"), exist_ok=True)
@@ -423,13 +423,7 @@ def multi_omic_stabl_cv(
                         Xte = X_test_tmp_std.loc[test_idx_tmp, sel_cols]
 
                         # Final model: CoxPH “mỏng” (ổn khi số feature đã nhỏ)
-                        final_cox = CoxPHSurvivalAnalysis(
-                            alpha=0.1,
-                            ties='breslow',
-                            n_iter=1000,
-                            tol=1e-7,
-                            verbose=0
-                        ).fit(Xtr.values, y_tmp_struct)
+                        final_cox = CoxPHSurvivalAnalysis().fit(Xtr.values, y_tmp_struct)
 
                         # Risk score = Xβ (decision_function), đơn điệu với hazard
                         risk_scores = pd.Series(
@@ -652,13 +646,7 @@ def multi_omic_stabl_cv(
                             event=y_train["event"].astype(bool).values,
                             time=y_train["time"].astype(float).values
                         )
-                    final_cox = CoxPHSurvivalAnalysis(
-                        alpha=0.1,
-                        ties='breslow',
-                        n_iter=1000,
-                        tol=1e-7,
-                        verbose=0
-                    ).fit(X_train.values, y_train_struct)
+                    final_cox = CoxPHSurvivalAnalysis().fit(X_train.values, y_train_struct)
                     risk = final_cox.predict(X_test.values)
                     predictions_dict[model].loc[test_idx, f"Fold n°{k}"] = risk
 
@@ -1240,21 +1228,21 @@ def multi_omic_stabl(
                 elif task_type == "regression":
                     model_preds = base_linear_model.predict(X_test_std)
                 elif task_type == "survival":
+                    from sksurv.linear_model import CoxnetSurvivalAnalysis
                     from sksurv.util import Surv
                     y_surv_train = Surv.from_arrays(
                         event=y["event"].astype(bool).to_numpy(),
                         time=y["time"].to_numpy()
                     )
-                    alpha0 = 0.1
-                    if stabl_cox is not None and hasattr(stabl_cox, "fitted_lambda_grid_") and "alpha" in stabl_cox.fitted_lambda_grid_:
-                        alpha0 = np.median(stabl_cox.fitted_lambda_grid_["alpha"])
-                    cox_final = CoxPHSurvivalAnalysis(
-                        alpha=alpha0,
-                        ties='breslow',
-                        n_iter=1000,
-                        tol=1e-7,
-                        verbose=0
-                    )
+                    # chọn alpha tương tự như phần CV: median alpha của STABL Cox nếu có; else 1.0
+                    alpha0 = None
+                    if stabl_cox is not None and hasattr(stabl_cox, "fitted_lambda_grid_") and "alphas" in stabl_cox.fitted_lambda_grid_:
+                        alist = [float(a[0]) for a in stabl_cox.fitted_lambda_grid_["alphas"]]
+                        alpha0 = np.median(alist)
+                    if alpha0 is None:
+                        alpha0 = 1.0
+                    cox_final = CoxnetSurvivalAnalysis(l1_ratio=1.0, alphas=np.array([alpha0]), max_iter=1_000_000, tol=1e-4)
+                    # Fit trên X_train_std (đã chuẩn hóa) với features đã chọn
                     cox_final.fit(X_train_std, y_surv_train)
                     model_preds = cox_final.predict(X_test_std)
 
