@@ -172,7 +172,7 @@ def align_X_y(X, y):
     return X2, y2
 
 
-def build_stabl_cox(n_bootstraps=500, random_state=42):
+def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None):
     """
     ✅ v4 VERSION: Coxnet (Lasso) for STABL feature selection.
     
@@ -195,7 +195,7 @@ def build_stabl_cox(n_bootstraps=500, random_state=42):
         n_bootstraps=n_bootstraps,
         artificial_type="knockoff",
         artificial_proportion=0.5,
-        sample_fraction=1.0,
+        sample_fraction=0.5,
         replace=False,
         bootstrap_threshold="median",
         fdr_threshold_range=np.arange(0.05, 1.01, 0.05),
@@ -204,7 +204,8 @@ def build_stabl_cox(n_bootstraps=500, random_state=42):
         task_type="survival",
         random_state=random_state,
         n_jobs=-1,
-        verbose=1
+        verbose=1,
+        debug_dir=debug_dir
     )
     return stabl_cox
 
@@ -257,7 +258,7 @@ def main(args):
         print(f"[WARNING] EPV < 10 may lead to overfitting. Consider reducing --num_genes to {max(10, int(n_events/10))}")
 
     # 3) Estimators dict + models list
-    stabl_cox = build_stabl_cox(n_bootstraps=args.n_boot, random_state=args.seed)
+    stabl_cox = build_stabl_cox(n_bootstraps=args.n_boot, random_state=args.seed, debug_dir=args.debug_dir)
     
     # If lambda_grid is None (auto mode), we can't print range yet.
     if isinstance(stabl_cox.lambda_grid, dict):
@@ -346,6 +347,10 @@ if __name__ == "__main__":
         default=100,
         help="Keep only the first N genes in file order (after duplicate aggregation)."
     )
+    parser.add_argument("--debug_dir", type=str, default=None, help="Directory to save debug info")
 
     args = parser.parse_args()
     main(args)
+
+
+

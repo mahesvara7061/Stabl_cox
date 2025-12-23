@@ -27,6 +27,8 @@ from .visualization import boxplot_features, scatterplot_features
 def classic_bootstrap(y, n_subsamples, replace=True, class_weight=None, rng=np.random.default_rng(None), task_type="binary", **kwargs):
     """Function to create a bootstrap sample from the original dataset.
     Weights can be used to make some samples more likely to be selected.
+    
+    Updated to perform stratified sampling for binary and survival tasks to preserve class/event proportions.
 
     Parameters
     ----------
@@ -65,23 +67,65 @@ def classic_bootstrap(y, n_subsamples, replace=True, class_weight=None, rng=np.r
                          f"number of samples in the original dataset. Got `n_repeats`={n_samples} "
                          f"and `n_subsamples`={n_subsamples}")
 
-    if class_weight is not None:
-        samples_weight = compute_sample_weight(class_weight, y)
-        sampling_probs = samples_weight / samples_weight.sum()
+    # Determine stratification labels
+    stratify_labels = None
+    if class_weight is None: # Only stratify if no custom weights are provided
+        if task_type == "binary":
+            stratify_labels = y
+        elif task_type == "survival":
+            if isinstance(y, np.ndarray) and hasattr(y.dtype, 'names') and 'event' in y.dtype.names:
+                stratify_labels = y['event']
+            elif isinstance(y, pd.DataFrame) and 'event' in y.columns:
+                stratify_labels = y['event'].values
+            elif isinstance(y, np.ndarray) and y.ndim == 2:
+                stratify_labels = y[:, 1] # Assume 2nd column is event
+
+    if stratify_labels is not None:
+        # Stratified sampling
+        unique_classes, class_counts = np.unique(stratify_labels, return_counts=True)
+        indices = np.arange(n_samples)
+        sampled_indices_list = []
+        
+        for cls, count in zip(unique_classes, class_counts):
+            cls_indices = indices[stratify_labels == cls]
+            # Calculate proportional number of samples
+            n_draw = int(np.round(n_subsamples * (count / n_samples)))
+            
+            if n_draw > 0:
+                sampled_cls = rng.choice(cls_indices, size=n_draw, replace=replace)
+                sampled_indices_list.append(sampled_cls)
+        
+        sampled_indices = np.concatenate(sampled_indices_list)
+        
+        # Adjust for rounding errors to match n_subsamples exactly
+        if len(sampled_indices) != n_subsamples:
+            diff = n_subsamples - len(sampled_indices)
+            if diff > 0:
+                # Add random samples from the whole population
+                extra = rng.choice(indices, size=diff, replace=replace)
+                sampled_indices = np.concatenate([sampled_indices, extra])
+            else:
+                # Remove random samples
+                rng.shuffle(sampled_indices)
+                sampled_indices = sampled_indices[:n_subsamples]
+        
+        rng.shuffle(sampled_indices)
 
     else:
-        sampling_probs = None
+        if class_weight is not None:
+            samples_weight = compute_sample_weight(class_weight, y)
+            sampling_probs = samples_weight / samples_weight.sum()
+        else:
+            sampling_probs = None
 
-    sampled_indices = rng.choice(
-        a=n_samples,
-        size=n_subsamples,
-        replace=replace,
-        p=sampling_probs
-    )
+        sampled_indices = rng.choice(
+            a=n_samples,
+            size=n_subsamples,
+            replace=replace,
+            p=sampling_probs
+        )
 
 
-    # Handling the case of binary classification where we only select one class
-    # REPLACE lines 82-91 with:
     # Task-specific validation
     needs_resample = False
     
@@ -1142,7 +1186,8 @@ class Stabl(SelectorMixin, BaseEstimator):
             verbose=0,
             n_jobs=-1,
             random_state=None,
-            task_type="binary"
+            task_type="binary",
+            debug_dir=None
     ):
         if fdr_threshold_range is None:
             fdr_threshold_range = np.arange(0., 1., .01)
@@ -1177,6 +1222,7 @@ class Stabl(SelectorMixin, BaseEstimator):
         self.explore_threshold = None
         self.fitted_lambda_grid_ = None
         self.task_type = task_type
+        self.debug_dir = debug_dir
 
 
         # --- Polyfill cho sklearn cũ: _validate_data ---
@@ -1491,6 +1537,40 @@ class Stabl(SelectorMixin, BaseEstimator):
                 artificial_type=self.artificial_type,
                 random_state=self.random_state
             )
+        
+        # [DEBUG] Save X with artificial features
+        current_debug_dir = self.debug_dir
+        if self.debug_dir and hasattr(self, 'debug_suffix') and self.debug_suffix:
+            current_debug_dir = Path(self.debug_dir, self.debug_suffix)
+
+        if current_debug_dir:
+            try:
+                os.makedirs(current_debug_dir, exist_ok=True)
+                
+                # Construct feature names for clarity
+                n_real = getattr(self, "n_features_in_", X.shape[1] - n_injected_noise)
+                if hasattr(self, 'feature_names_in_'):
+                    feat_names = list(self.feature_names_in_)
+                else:
+                    feat_names = [f"Feature_{i}" for i in range(n_real)]
+                
+                n_total = X.shape[1]
+                n_artificial = n_total - len(feat_names)
+                art_names = [f"Artificial_{i}" for i in range(n_artificial)]
+                all_names = feat_names + art_names
+                
+                debug_X_path = Path(current_debug_dir, "X_with_artificial.csv")
+                # Ensure dimensions match before saving with columns
+                if len(all_names) == X.shape[1]:
+                    pd.DataFrame(X, columns=all_names).to_csv(debug_X_path)
+                else:
+                    pd.DataFrame(X).to_csv(debug_X_path)
+                    print(f"[DEBUG] Feature name mismatch ({len(all_names)} vs {X.shape[1]}), saved without headers.")
+
+                print(f"[DEBUG] Saved X (with artificial) to {debug_X_path}")
+            except Exception as e:
+                print(f"[DEBUG] Failed to save X: {e}")
+
         corr_groups = None
         if self.perc_corr_group_threshold is not None or self.sgl_groups is not None:
             corr_groups = self._make_groups(X)
@@ -1508,6 +1588,25 @@ class Stabl(SelectorMixin, BaseEstimator):
             random_state=self.random_state,
             task_type=self.task_type  # ← ADD THIS LINE
         )
+
+        # [DEBUG] Save bootstrap indices
+        if current_debug_dir:
+            try:
+                debug_indices_path = Path(current_debug_dir, "bootstrap_indices.csv")
+                # Save as CSV where each row is a bootstrap sample
+                # Check if all have same length
+                lens = [len(x) for x in bootstrap_indices]
+                if len(set(lens)) == 1:
+                    pd.DataFrame(bootstrap_indices).to_csv(debug_indices_path, index=False, header=False)
+                else:
+                    # Save as text if lengths differ
+                    with open(debug_indices_path.with_suffix('.txt'), 'w') as f:
+                        for idxs in bootstrap_indices:
+                            f.write(",".join(map(str, idxs)) + "\n")
+                
+                print(f"[DEBUG] Saved bootstrap indices to {debug_indices_path}")
+            except Exception as e:
+                print(f"[DEBUG] Failed to save bootstrap indices: {e}")
 
         # --Loop--
         leave = (self.verbose > 0)
@@ -1575,6 +1674,27 @@ class Stabl(SelectorMixin, BaseEstimator):
                     selected_variables)[:, n_features:].mean(axis=0)
             self.stabl_scores_[:, idx] = np.vstack(selected_variables)[
                 :, :n_features].mean(axis=0)
+            
+            # [DEBUG] Save selected variables for this lambda
+            if current_debug_dir:
+                try:
+                    lambda_str = f"lambda_{idx}"
+                    # selected_variables is a list of boolean arrays (n_bootstraps, n_total_features)
+                    sel_mat = np.vstack(selected_variables)
+                    
+                    debug_sel_path = Path(current_debug_dir, f"selected_features_{lambda_str}.csv")
+                    
+                    # Use all_names if available (from previous debug block)
+                    if 'all_names' in locals() and len(all_names) == sel_mat.shape[1]:
+                        pd.DataFrame(sel_mat, columns=all_names).to_csv(debug_sel_path, index=False)
+                    else:
+                        pd.DataFrame(sel_mat).to_csv(debug_sel_path, index=False)
+                    
+                    # Log stats
+                    n_sel_avg = sel_mat.sum(axis=1).mean()
+                    print(f"[DEBUG] Lambda {idx}: Avg features selected per boot: {n_sel_avg:.2f}. Saved to {debug_sel_path}")
+                except Exception as e:
+                    print(f"[DEBUG] Failed to save selected features for lambda {idx}: {e}")
 
         if self.artificial_type is not None:
             self._compute_FDPplus()

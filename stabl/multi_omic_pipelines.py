@@ -396,6 +396,10 @@ def multi_omic_stabl_cv(
                 if stabl_cox is None:
                     raise ValueError("Bạn thêm 'STABL Cox' vào models nhưng chưa khai báo estimators['stabl_cox'].")
 
+                # Set debug suffix for this fold/omic
+                if hasattr(stabl_cox, 'debug_dir') and stabl_cox.debug_dir:
+                    stabl_cox.debug_suffix = f"{omic_name}_fold{k}"
+
                 print("Fitting of STABL Cox")
                 stabl_cox.fit(X_tmp_std, y_tmp, groups=groups)
                 tmp_sel_features = list(stabl_cox.get_feature_names_out())
