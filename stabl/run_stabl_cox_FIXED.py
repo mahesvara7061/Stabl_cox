@@ -30,7 +30,7 @@ def detect_sep(path):
     return ","
 
 
-def load_counts(counts_path, num_genes: int | None = None):
+def load_counts(counts_path, num_genes: int | None = None, debug_dir: str | None = None):
     """
     Read counts: first 2 columns = gene_name, entrez_id; remaining columns = samples.
     Returns:
@@ -54,8 +54,22 @@ def load_counts(counts_path, num_genes: int | None = None):
     expr = df[sample_cols].copy()
     expr.index = df[gene_col].astype(str).values
 
+    # [DEBUG] Check for duplicates
+    if expr.index.duplicated().any():
+        dup_genes = expr.index[expr.index.duplicated()].unique()
+        print(f"[DEBUG] Found {len(dup_genes)} duplicated genes. First 50: {list(dup_genes)[:50]}")
+        
+        if debug_dir:
+            try:
+                os.makedirs(debug_dir, exist_ok=True)
+                pd.Series(dup_genes, name="Duplicated_Genes").to_csv(Path(debug_dir) / "duplicated_genes.csv", index=False)
+                print(f"[DEBUG] Saved duplicated genes list to {Path(debug_dir) / 'duplicated_genes.csv'}")
+            except Exception as e:
+                print(f"[DEBUG] Failed to save duplicated genes: {e}")
+
     # Aggregate duplicates by median WITHOUT sorting
     expr = expr.groupby(expr.index, sort=False).median()
+
 
     # Reindex to first-appearance order
     expr = expr.reindex(unique_genes_in_order.intersection(expr.index))
@@ -214,7 +228,7 @@ def main(args):
     os.makedirs(args.outdir, exist_ok=True)
 
     # 1) Load data
-    X = load_counts(args.counts, num_genes=args.num_genes)
+    X = load_counts(args.counts, num_genes=args.num_genes, debug_dir=args.debug_dir)
     print(f"[INFO] Using {X.shape[1]} genes.")
 
     y = load_clinical(args.clinical)
