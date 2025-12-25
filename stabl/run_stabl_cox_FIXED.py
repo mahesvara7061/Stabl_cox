@@ -53,7 +53,7 @@ def load_counts(counts_path, num_genes: int | None = None, debug_dir: str | None
     # Matrix genes x samples
     expr = df[sample_cols].copy()
     expr.index = df[gene_col].astype(str).values
-
+    print(f"Example genes (first 5): {list(expr.index[:5])}")
     # [DEBUG] Check for duplicates
     if expr.index.duplicated().any():
         dup_genes = expr.index[expr.index.duplicated()].unique()
