@@ -67,6 +67,9 @@ def load_counts(counts_path, num_genes: int | None = None, debug_dir: str | None
             except Exception as e:
                 print(f"[DEBUG] Failed to save duplicated genes: {e}")
 
+    else:
+        print("[DEBUG] No duplicated genes found.")
+
     # Aggregate duplicates by median WITHOUT sorting
     expr = expr.groupby(expr.index, sort=False).median()
 
