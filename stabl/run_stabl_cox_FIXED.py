@@ -194,7 +194,7 @@ def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None):
         lambda_grid=lambda_grid,
         n_bootstraps=n_bootstraps,
         artificial_type="knockoff",
-        artificial_proportion=0.5,
+        artificial_proportion=1,
         sample_fraction=0.5,
         replace=False,
         bootstrap_threshold="median",

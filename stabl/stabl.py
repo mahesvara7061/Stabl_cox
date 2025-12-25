@@ -1562,9 +1562,9 @@ class Stabl(SelectorMixin, BaseEstimator):
                 debug_X_path = Path(current_debug_dir, "X_with_artificial.csv")
                 # Ensure dimensions match before saving with columns
                 if len(all_names) == X.shape[1]:
-                    pd.DataFrame(X, columns=all_names).to_csv(debug_X_path)
+                    pd.DataFrame(X, columns=all_names).T.to_csv(debug_X_path)
                 else:
-                    pd.DataFrame(X).to_csv(debug_X_path)
+                    pd.DataFrame(X).T.to_csv(debug_X_path)
                     print(f"[DEBUG] Feature name mismatch ({len(all_names)} vs {X.shape[1]}), saved without headers.")
 
                 print(f"[DEBUG] Saved X (with artificial) to {debug_X_path}")
@@ -1686,9 +1686,9 @@ class Stabl(SelectorMixin, BaseEstimator):
                     
                     # Use all_names if available (from previous debug block)
                     if 'all_names' in locals() and len(all_names) == sel_mat.shape[1]:
-                        pd.DataFrame(sel_mat, columns=all_names).to_csv(debug_sel_path, index=False)
+                        pd.DataFrame(sel_mat, columns=all_names).T.to_csv(debug_sel_path)
                     else:
-                        pd.DataFrame(sel_mat).to_csv(debug_sel_path, index=False)
+                        pd.DataFrame(sel_mat).T.to_csv(debug_sel_path)
                     
                     # Log stats
                     n_sel_avg = sel_mat.sum(axis=1).mean()
