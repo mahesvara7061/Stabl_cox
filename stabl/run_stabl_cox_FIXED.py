@@ -6,6 +6,9 @@ import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import sys
+import io
+import traceback
 
 # Local imports
 from .multi_omic_pipelines import multi_omic_stabl_cv
@@ -227,7 +230,7 @@ def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None):
     return stabl_cox
 
 
-def main(args):
+def run_pipeline(args):
     os.makedirs(args.outdir, exist_ok=True)
 
     # 1) Load data
@@ -347,6 +350,54 @@ def main(args):
 
     print(f"[DONE] Full results (CSV/Figures) saved at: {Path(args.outdir).resolve()}")
     print(f"[DONE] Quick summary: {out_summary.resolve()}")
+
+
+def main(args):
+    # Setup logging
+    log_buffer = None
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    if args.debug_dir:
+        os.makedirs(args.debug_dir, exist_ok=True)
+        log_buffer = io.StringIO()
+        
+        class Tee(object):
+            def __init__(self, stream, buffer):
+                self.stream = stream
+                self.buffer = buffer
+            def write(self, message):
+                self.stream.write(message)
+                self.buffer.write(message)
+            def flush(self):
+                self.stream.flush()
+            def fileno(self):
+                return self.stream.fileno()
+                
+        sys.stdout = Tee(original_stdout, log_buffer)
+        sys.stderr = Tee(original_stderr, log_buffer)
+
+    try:
+        run_pipeline(args)
+    except KeyboardInterrupt:
+        print("\n[INFO] Process interrupted by user (KeyboardInterrupt).")
+    except Exception as e:
+        print(f"\n[ERROR] An error occurred: {e}")
+        traceback.print_exc()
+    finally:
+        if log_buffer:
+            # Restore streams
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            
+            # Save log
+            try:
+                log_path = Path(args.debug_dir) / "run_log.txt"
+                with open(log_path, "w", encoding="utf-8") as f:
+                    f.write(log_buffer.getvalue())
+                print(f"[DEBUG] Terminal log saved to {log_path}")
+            except Exception as e:
+                print(f"[ERROR] Failed to save log file: {e}")
 
 
 if __name__ == "__main__":
