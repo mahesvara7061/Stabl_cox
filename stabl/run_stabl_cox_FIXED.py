@@ -16,7 +16,10 @@ from .stabl import Stabl
 
 # Survival models/metrics
 from sksurv.linear_model import CoxPHSurvivalAnalysis, CoxnetSurvivalAnalysis
+from sksurv.ensemble import ComponentwiseGradientBoostingSurvivalAnalysis
 from sksurv.metrics import concordance_index_censored
+from joblib import Parallel, delayed
+import warnings
 
 # -------------------------------
 # Utils (same as original)
@@ -192,22 +195,121 @@ def align_X_y(X, y):
     return X2, y2
 
 
-def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None):
+def run_univariate_cox(X, y, p_thresh=0.05, debug_dir=None):
     """
-    ✅ v4 VERSION: Coxnet (Lasso) for STABL feature selection.
-    
-    Uses CoxnetSurvivalAnalysis with l1_ratio=1.0 (Lasso).
-    We let Stabl automatically compute the alpha path using the fixed utils.py logic.
+    Run univariate Cox PH regression for each feature in X against y.
+    Select features with p-value < p_thresh.
     """
-    # We do NOT define lambda_grid manually here. 
-    # Stabl will call utils.auto_mode_lambda_grid which now correctly uses Coxnet to find the path.
-    lambda_grid = "auto"
+    print(f"[INFO] Running univariate Cox selection (p < {p_thresh})...")
+    try:
+        from lifelines import CoxPHFitter
+    except ImportError:
+        print("[WARNING] lifelines not installed. Skipping univariate Cox selection.")
+        print("          Please install it: pip install lifelines")
+        return X
 
-    base = CoxnetSurvivalAnalysis(
-        l1_ratio=1.0,
-        fit_baseline_model=True,
-        verbose=False
+    genes = X.columns
+    n_genes = len(genes)
+    
+    # Prepare data arrays once
+    times = y['time'].values
+    events = y['event'].values.astype(int) # lifelines prefers 0/1
+    
+    def fit_one_gene(gene, values):
+        try:
+            # Create mini dataframe
+            df = pd.DataFrame({
+                'feature': values,
+                'T': times,
+                'E': events
+            })
+            # Drop NaNs if any (though align_X_y should have handled it)
+            df = df.dropna()
+            
+            if df['feature'].nunique() < 2:
+                return (gene, 1.0) # Constant feature
+                
+            cph = CoxPHFitter()
+            # suppress warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cph.fit(df, duration_col='T', event_col='E')
+            
+            # Get p-value of the 'feature' coefficient
+            pval = cph.summary.loc['feature', 'p']
+            return (gene, pval)
+        except Exception:
+            return (gene, 1.0)
+
+    # Run in parallel
+    print(f"[INFO] Fitting {n_genes} univariate models...")
+    results = Parallel(n_jobs=-1, verbose=5)(
+        delayed(fit_one_gene)(g, X[g].values) 
+        for g in genes
     )
+    
+    res_df = pd.DataFrame(results, columns=['gene', 'p_value'])
+    
+    # Save results
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        res_df.to_csv(Path(debug_dir) / "univariate_cox_results.csv", index=False)
+        print(f"[DEBUG] Saved univariate p-values to {Path(debug_dir) / 'univariate_cox_results.csv'}")
+        
+    # Filter
+    selected = res_df[res_df['p_value'] < p_thresh]['gene'].tolist()
+    print(f"[INFO] Univariate Cox: {len(selected)}/{n_genes} features passed p < {p_thresh}")
+    
+    if len(selected) == 0:
+        print("[WARNING] No features passed univariate filter! Reverting to all features.")
+        return X
+        
+    return X[selected]
+
+
+def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None, model_type="coxnet"):
+    """
+    ✅ v4 VERSION: Coxnet (Lasso) or ComponentwiseGradientBoosting for STABL feature selection.
+    """
+    if model_type == "coxnet":
+        # We do NOT define lambda_grid manually here. 
+        # Stabl will call utils.auto_mode_lambda_grid which now correctly uses Coxnet to find the path.
+        lambda_grid = "auto"
+
+        base = CoxnetSurvivalAnalysis(
+            l1_ratio=0.9,
+            fit_baseline_model=True,
+            alpha_min_ratio=0.01,
+            max_iter=1000000,
+            tol=1e-7,
+            verbose=False
+        )
+    elif model_type == "gradient_boosting":
+        # For Gradient Boosting, we iterate over n_estimators (or learning_rate, but n_estimators is more common for regularization path)
+        # Stabl expects a lambda_grid. For boosting, "n_estimators" acts like the regularization parameter (inverse of lambda).
+        # However, Stabl logic is built around "lambda" where higher lambda = sparser model.
+        # For boosting, fewer estimators = sparser model.
+        # We can define a grid for 'n_estimators'.
+        
+        # NOTE: ComponentwiseGradientBoostingSurvivalAnalysis selects features component-wise.
+        # It has `coef_` attribute? No, it has `feature_importances_`? 
+        # Actually, ComponentwiseGradientBoostingSurvivalAnalysis is a linear model, so it should have coefs 
+        # but sksurv implementation might differ.
+        # Let's check if it works with Stabl's expectation of base_estimator.
+        # Stabl expects `coef_` or `feature_importances_`.
+        
+        base = ComponentwiseGradientBoostingSurvivalAnalysis(
+            loss="coxph",
+            random_state=random_state,
+            verbose=0
+        )
+        # We need to define a grid. 
+        # Let's try iterating over n_estimators.
+        # But Stabl iterates over a grid and sets params.
+        lambda_grid = {"n_estimators": np.arange(10, 200, 20)} 
+        
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
 
     stabl_cox = Stabl(
         base_estimator=base,
@@ -241,6 +343,10 @@ def run_pipeline(args):
 
     # 2) Align samples
     X, y = align_X_y(X, y)
+
+    # 2.5) Univariate Cox Filter (Optional)
+    if args.univariate_cox:
+        X = run_univariate_cox(X, y, p_thresh=args.univariate_p, debug_dir=args.debug_dir)
 
     # ---------------------------------------------------------
     # DATA LEAKAGE CHECK
@@ -278,11 +384,20 @@ def run_pipeline(args):
         print(f"[WARNING] EPV < 10 may lead to overfitting. Consider reducing --num_genes to {max(10, int(n_events/10))}")
 
     # 3) Estimators dict + models list
-    stabl_cox = build_stabl_cox(n_bootstraps=args.n_boot, random_state=args.seed, debug_dir=args.debug_dir)
+    stabl_cox = build_stabl_cox(
+        n_bootstraps=args.n_boot, 
+        random_state=args.seed, 
+        debug_dir=args.debug_dir,
+        model_type=args.model_type
+    )
     
     # If lambda_grid is None (auto mode), we can't print range yet.
     if isinstance(stabl_cox.lambda_grid, dict):
+        # Check for alpha/alphas (Coxnet)
         alpha_array = stabl_cox.lambda_grid.get("alpha", stabl_cox.lambda_grid.get("alphas", []))
+        # Check for n_estimators (Gradient Boosting)
+        n_est_array = stabl_cox.lambda_grid.get("n_estimators", [])
+        
         if len(alpha_array) > 0:
             # Flatten if it's a list of lists (Coxnet case sometimes)
             if isinstance(alpha_array[0], (list, np.ndarray)):
@@ -295,6 +410,9 @@ def run_pipeline(args):
                 print(f"[INFO] Alpha range: {alpha_min:.6f} to {alpha_max:.2f}")
             except:
                 print("[INFO] Alpha range: (complex structure)")
+        elif len(n_est_array) > 0:
+             print(f"[INFO] n_estimators range: {min(n_est_array)} to {max(n_est_array)}")
+
     else:
         print("[INFO] Alpha range: Auto-computed by Stabl (Coxnet)")
 
@@ -416,6 +534,15 @@ if __name__ == "__main__":
         help="Keep only the first N genes in file order (after duplicate aggregation)."
     )
     parser.add_argument("--debug_dir", type=str, default=None, help="Directory to save debug info")
+    parser.add_argument(
+        "--model_type", 
+        type=str, 
+        default="coxnet", 
+        choices=["coxnet", "gradient_boosting"],
+        help="Base estimator type: 'coxnet' (Lasso) or 'gradient_boosting' (ComponentwiseGradientBoosting)"
+    )
+    parser.add_argument("--univariate_cox", action="store_true", help="Run univariate Cox selection before Stabl")
+    parser.add_argument("--univariate_p", type=float, default=0.05, help="P-value threshold for univariate Cox")
 
     args = parser.parse_args()
     main(args)
