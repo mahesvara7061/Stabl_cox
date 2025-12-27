@@ -1,0 +1,5 @@
+1. CGGA325 chỉ đẻ chọn feature mọi báo cáo về cindex đều báo cáo trên các bộ khác: cgga325 để chọn feature, chia train test các bộ còn lại và train và test lại ra cindex trên 3 bộ còn lại.
+2. Lúc test với các feature đã chọn trên các dataset khác thử các mô hình survival khác nhau.
+3. Thử cross dataset validation.
+4. THử vấn đề với các vấn đề dễ hơn (eg. HCC, hoặc biến os thành categorical)
+5. univariate cox chỉ mang tính gợi ý, ko khẳng định, ko nên coi nó để lọc gene hay report. Mạnh hơn thì tìm paper support nhưng cũng chỉ mang tính định hướng.
