@@ -492,7 +492,7 @@ except ImportError:
     from stabl.stabl import Stabl, save_stabl_results
 
 from sksurv.linear_model import CoxPHSurvivalAnalysis, CoxnetSurvivalAnalysis
-from sksurv.ensemble import ComponentwiseGradientBoostingSurvivalAnalysis
+from sksurv.ensemble import ComponentwiseGradientBoostingSurvivalAnalysis, RandomSurvivalForest
 from sksurv.metrics import concordance_index_censored
 from sksurv.util import Surv
 from joblib import Parallel, delayed
@@ -742,7 +742,7 @@ def run_univariate_cox(X, y, p_thresh=0.05, debug_dir=None):
 
 def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None, model_type="coxnet"):
     """
-    ✅ v4 VERSION: Coxnet (Lasso) or ComponentwiseGradientBoosting for STABL feature selection.
+    ✅ v4 VERSION: Coxnet (Lasso), ComponentwiseGradientBoosting, or RSF for STABL feature selection.
     """
     if model_type == "coxnet":
         # Stabl will call utils.auto_mode_lambda_grid which now correctly uses Coxnet to find the path.
@@ -765,6 +765,18 @@ def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None, model_typ
         # Gradient Boosting uses n_estimators as the regularization parameter
         lambda_grid = {"n_estimators": np.arange(10, 200, 20)} 
         
+    elif model_type == "rsf":
+        base = RandomSurvivalForest(
+            n_estimators=100,
+            min_samples_split=10,
+            max_depth=10,
+            max_features="sqrt",
+            n_jobs=-1,
+            random_state=random_state,
+            verbose=0
+        )
+        lambda_grid = {"min_samples_leaf": np.arange(2, 22, 2)}
+
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -881,12 +893,12 @@ def run_pipeline(args):
     # ---------------------------------------------------------
     print("\n[STEP 3] Loading Verify Data and Splitting...")
     
-    # Load Verify Data - Keep all genes initially
-    X_verify = load_counts(args.verify_counts, num_genes=None, debug_dir=args.debug_dir) 
+    # Load Verify Data - Use same num_genes as selection if provided
+    X_verify = load_counts(args.verify_counts, num_genes=args.num_genes, debug_dir=args.debug_dir) 
     y_verify = load_clinical(args.verify_clinical)
     X_verify, y_verify = align_X_y(X_verify, y_verify)
     
-    print(f"Verify Data (Total): {X_verify.shape[0]} samples")
+    print(f"Verify Data (Total): {X_verify.shape[0]} samples, {X_verify.shape[1]} genes")
 
     # Split Verify Data
     X_train, X_test, y_train, y_test = train_test_split(
@@ -915,9 +927,9 @@ def run_pipeline(args):
     X_test_sub = X_test[selected_features]
 
     # ---------------------------------------------------------
-    # 5. Train Final Cox Model
+    # 5. Train Final Models (Selected vs Full)
     # ---------------------------------------------------------
-    print("\n[STEP 4] Training Final Cox Model on Verify Train Split...")
+    print("\n[STEP 4] Training Final Models on Verify Train Split...")
     
     # Prepare structured arrays for sksurv
     y_train_surv = Surv.from_arrays(
@@ -928,36 +940,64 @@ def run_pipeline(args):
         event=y_test['event'].astype(bool).values, 
         time=y_test['time'].values
     )
-    
-    # Use standard CoxPH
-    final_model = CoxPHSurvivalAnalysis()
-    try:
-        final_model.fit(X_train_sub, y_train_surv)
-    except Exception as e:
-        print(f"[ERROR] Failed to fit final Cox model: {e}")
-        return
-    
+
+    # Define models to evaluate
+    models_dict = {
+        "CoxPH": CoxPHSurvivalAnalysis(),
+        "Coxnet": CoxnetSurvivalAnalysis(l1_ratio=0.9, alpha_min_ratio=0.01, fit_baseline_model=True),
+        "GradientBoosting": ComponentwiseGradientBoostingSurvivalAnalysis(loss="coxph", random_state=args.seed),
+        "RSF": RandomSurvivalForest(n_estimators=100, min_samples_split=10, min_samples_leaf=15, max_features="sqrt", n_jobs=-1, random_state=args.seed)
+    }
+
+    results_list = []
+
+    def evaluate_models(X_tr, X_te, y_tr_s, y_te_s, label):
+        print(f"\n--- Evaluating Models on {label} Features ({X_tr.shape[1]} features) ---")
+        for name, model in models_dict.items():
+            # Skip standard CoxPH if p > n (singular matrix issue)
+            if name == "CoxPH" and X_tr.shape[1] > X_tr.shape[0]:
+                print(f"Skipping {name} for {label} (p > n)")
+                continue
+                
+            try:
+                model.fit(X_tr, y_tr_s)
+                c_train = model.score(X_tr, y_tr_s)
+                c_test = model.score(X_te, y_te_s)
+                print(f"[{label}] {name}: Train C={c_train:.4f}, Test C={c_test:.4f}")
+                
+                results_list.append({
+                    "Feature_Set": label,
+                    "Model": name,
+                    "Train_C_Index": c_train,
+                    "Test_C_Index": c_test,
+                    "Num_Features": X_tr.shape[1]
+                })
+            except Exception as e:
+                print(f"[{label}] {name} Failed: {e}")
+
+    # 1. Evaluate on Selected Features
+    evaluate_models(X_train_sub, X_test_sub, y_train_surv, y_test_surv, "Selected")
+
+    # 2. Evaluate on Full Features (Verify Data)
+    # Note: This might be slow if verify data has many genes
+    evaluate_models(X_train, X_test, y_train_surv, y_test_surv, "Full")
+
     # ---------------------------------------------------------
-    # 6. Evaluate
+    # 6. Save Results
     # ---------------------------------------------------------
-    print("\n[STEP 5] Evaluating on Verify Test Split...")
+    print("\n[STEP 5] Saving Results...")
     
-    # C-index on Train
-    train_c = final_model.score(X_train_sub, y_train_surv)
-    print(f"Verify Train C-index: {train_c:.4f}")
-    
-    # C-index on Test
-    test_c = final_model.score(X_test_sub, y_test_surv)
-    print(f"Verify Test C-index: {test_c:.4f}")
-    
-    # Save results
+    res_df = pd.DataFrame(results_list)
+    res_df.to_csv(Path(args.outdir) / "final_model_comparison.csv", index=False)
+    print(res_df)
+
     with open(Path(args.outdir) / "final_metrics.txt", "w") as f:
-        f.write(f"Verify Train C-index: {train_c:.4f}\n")
-        f.write(f"Verify Test C-index: {test_c:.4f}\n")
-        f.write(f"Selected Features: {len(selected_features)}\n")
         f.write(f"Verify Total Samples: {X_verify.shape[0]}\n")
         f.write(f"Verify Train Samples: {X_train.shape[0]}\n")
         f.write(f"Verify Test Samples: {X_test.shape[0]}\n")
+        f.write(f"Selected Features: {len(selected_features)}\n")
+        f.write("\n--- Model Comparison ---\n")
+        f.write(res_df.to_string())
 
     print(f"\n[DONE] Results saved to {args.outdir}")
 
@@ -1036,7 +1076,7 @@ if __name__ == "__main__":
         "--model_type", 
         type=str, 
         default="coxnet", 
-        choices=["coxnet", "gradient_boosting"],
+        choices=["coxnet", "gradient_boosting", "rsf"],
         help="Base estimator type"
     )
     parser.add_argument("--univariate_cox", action="store_true", help="Run univariate Cox selection before Stabl")
