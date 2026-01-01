@@ -804,85 +804,103 @@ def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None, model_typ
 def run_pipeline(args):
     os.makedirs(args.outdir, exist_ok=True)
     
-    # ---------------------------------------------------------
-    # 1. Load Selection Data
-    # ---------------------------------------------------------
-    print("\n[STEP 1] Loading Selection Data...")
-    X_sel = load_counts(args.selection_counts, num_genes=args.num_genes, debug_dir=args.debug_dir)
-    y_sel = load_clinical(args.selection_clinical)
-    X_sel, y_sel = align_X_y(X_sel, y_sel)
-    
-    # ---------------------------------------------------------
-    # DATA LEAKAGE CHECK (Added from FIXED version)
-    # ---------------------------------------------------------
-    leakage_keywords = [
-        "os", "time", "overall_survival", "survival_time", "days_to_death", "days to death",
-        "censored", "censor", "status", "event", "vital_status", "vital status",
-        "outcome", "survival"
-    ]
-    to_drop = []
-    for col in X_sel.columns:
-        if str(col).strip().lower() in leakage_keywords:
-            to_drop.append(col)
-    
-    if to_drop:
-        print(f"[WARNING] Potential data leakage detected! Dropping columns from X_sel: {to_drop}")
-        X_sel = X_sel.drop(columns=to_drop)
-    # ---------------------------------------------------------
+    selected_features = []
 
-    print(f"Selection Data: {X_sel.shape[0]} samples, {X_sel.shape[1]} genes")
-    
-    # Check events-per-variable ratio
-    n_events = y_sel['event'].sum()
-    epv = n_events / X_sel.shape[1]
-    print(f"[INFO] Selection Events: {n_events}/{X_sel.shape[0]} ({100*n_events/X_sel.shape[0]:.1f}%)")
-    print(f"[INFO] Events-per-variable (EPV): {epv:.2f}")
-
-    if epv < 10:
-        print(f"[WARNING] EPV < 10 may lead to overfitting in selection. Consider reducing --num_genes.")
-
-    # Univariate Cox Filter (Optional)
-    if args.univariate_cox:
-        X_sel = run_univariate_cox(X_sel, y_sel, p_thresh=args.univariate_p, debug_dir=args.debug_dir)
-
-    # ---------------------------------------------------------
-    # 2. Run STABL Feature Selection
-    # ---------------------------------------------------------
-    print("\n[STEP 2] Running STABL Feature Selection...")
-    stabl_cox = build_stabl_cox(
-        n_bootstraps=args.n_boot, 
-        random_state=args.seed, 
-        debug_dir=args.debug_dir,
-        model_type=args.model_type
-    )
-    
-    stabl_cox.fit(X_sel, y_sel)
-    
-    # Get selected features
-    selected_mask = stabl_cox.get_support()
-    if hasattr(stabl_cox, "feature_names_in_"):
-        selected_features = stabl_cox.feature_names_in_[selected_mask]
+    if args.selected_features_file:
+        print(f"\n[INFO] Skipping Selection. Loading features from {args.selected_features_file}...")
+        try:
+            # Try reading as CSV first
+            sf_df = pd.read_csv(args.selected_features_file)
+            # Assuming the first column contains the features, or a column named "Selected_Features"
+            if "Selected_Features" in sf_df.columns:
+                selected_features = sf_df["Selected_Features"].tolist()
+            else:
+                selected_features = sf_df.iloc[:, 0].tolist()
+            
+            print(f"[INFO] Loaded {len(selected_features)} features from file.")
+        except Exception as e:
+            print(f"[ERROR] Failed to load selected features from file: {e}")
+            return
     else:
-        selected_features = X_sel.columns[selected_mask]
+        # ---------------------------------------------------------
+        # 1. Load Selection Data
+        # ---------------------------------------------------------
+        print("\n[STEP 1] Loading Selection Data...")
+        X_sel = load_counts(args.selection_counts, num_genes=args.num_genes, debug_dir=args.debug_dir)
+        y_sel = load_clinical(args.selection_clinical)
+        X_sel, y_sel = align_X_y(X_sel, y_sel)
         
-    print(f"[INFO] STABL selected {len(selected_features)} features: {list(selected_features)}")
-    
-    # Save selected features
-    pd.Series(selected_features, name="Selected_Features").to_csv(
-        Path(args.outdir) / "selected_features.csv", index=False
-    )
-    
-    # Save STABL results (plots etc)
-    try:
-        save_stabl_results(
-            stabl_cox, 
-            Path(args.outdir), 
-            X_sel, 
-            y_sel, 
-            task_type="survival"
+        # ---------------------------------------------------------
+        # DATA LEAKAGE CHECK (Added from FIXED version)
+        # ---------------------------------------------------------
+        leakage_keywords = [
+            "os", "time", "overall_survival", "survival_time", "days_to_death", "days to death",
+            "censored", "censor", "status", "event", "vital_status", "vital status",
+            "outcome", "survival"
+        ]
+        to_drop = []
+        for col in X_sel.columns:
+            if str(col).strip().lower() in leakage_keywords:
+                to_drop.append(col)
+        
+        if to_drop:
+            print(f"[WARNING] Potential data leakage detected! Dropping columns from X_sel: {to_drop}")
+            X_sel = X_sel.drop(columns=to_drop)
+        # ---------------------------------------------------------
+
+        print(f"Selection Data: {X_sel.shape[0]} samples, {X_sel.shape[1]} genes")
+        
+        # Check events-per-variable ratio
+        n_events = y_sel['event'].sum()
+        epv = n_events / X_sel.shape[1]
+        print(f"[INFO] Selection Events: {n_events}/{X_sel.shape[0]} ({100*n_events/X_sel.shape[0]:.1f}%)")
+        print(f"[INFO] Events-per-variable (EPV): {epv:.2f}")
+
+        if epv < 10:
+            print(f"[WARNING] EPV < 10 may lead to overfitting in selection. Consider reducing --num_genes.")
+
+        # Univariate Cox Filter (Optional)
+        if args.univariate_cox:
+            X_sel = run_univariate_cox(X_sel, y_sel, p_thresh=args.univariate_p, debug_dir=args.debug_dir)
+
+        # ---------------------------------------------------------
+        # 2. Run STABL Feature Selection
+        # ---------------------------------------------------------
+        print("\n[STEP 2] Running STABL Feature Selection...")
+        stabl_cox = build_stabl_cox(
+            n_bootstraps=args.n_boot, 
+            random_state=args.seed, 
+            debug_dir=args.debug_dir,
+            model_type=args.model_type
         )
-    except Exception as e:
-        print(f"[WARNING] Failed to save STABL plots: {e}")
+        
+        stabl_cox.fit(X_sel, y_sel)
+        
+        # Get selected features
+        selected_mask = stabl_cox.get_support()
+        if hasattr(stabl_cox, "feature_names_in_"):
+            selected_features = stabl_cox.feature_names_in_[selected_mask]
+        else:
+            selected_features = X_sel.columns[selected_mask]
+            
+        print(f"[INFO] STABL selected {len(selected_features)} features: {list(selected_features)}")
+        
+        # Save selected features
+        pd.Series(selected_features, name="Selected_Features").to_csv(
+            Path(args.outdir) / "selected_features.csv", index=False
+        )
+        
+        # Save STABL results (plots etc)
+        try:
+            save_stabl_results(
+                stabl_cox, 
+                Path(args.outdir), 
+                X_sel, 
+                y_sel, 
+                task_type="survival"
+            )
+        except Exception as e:
+            print(f"[WARNING] Failed to save STABL plots: {e}")
 
     if len(selected_features) == 0:
         print("[ERROR] No features selected. Cannot proceed to training.")
@@ -1081,6 +1099,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--univariate_cox", action="store_true", help="Run univariate Cox selection before Stabl")
     parser.add_argument("--univariate_p", type=float, default=0.05, help="P-value threshold for univariate Cox")
+    parser.add_argument("--selected_features_file", type=str, default=None, help="Path to file containing selected features (skip selection step)")
 
     args = parser.parse_args()
     main(args)
