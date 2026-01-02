@@ -486,10 +486,12 @@ import warnings
 # Local imports
 try:
     from .stabl import Stabl, save_stabl_results
+    from .preprocessing import LowInfoFilter
 except ImportError:
     # If running as script from stabl/ folder
     sys.path.append(str(Path(__file__).parent.parent))
     from stabl.stabl import Stabl, save_stabl_results
+    from stabl.preprocessing import LowInfoFilter
 
 from sksurv.linear_model import CoxPHSurvivalAnalysis, CoxnetSurvivalAnalysis
 from sksurv.ensemble import ComponentwiseGradientBoostingSurvivalAnalysis, RandomSurvivalForest
@@ -497,6 +499,8 @@ from sksurv.metrics import concordance_index_censored
 from sksurv.util import Surv
 from joblib import Parallel, delayed
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
 
 # -------------------------------
 # Utils (Ported from run_stabl_cox_FIXED.py)
@@ -831,6 +835,33 @@ def run_pipeline(args):
         X_sel, y_sel = align_X_y(X_sel, y_sel)
         
         # ---------------------------------------------------------
+        # Preprocessing
+        # ---------------------------------------------------------
+        print(f"[INFO] Applying LowInfoFilter (max_nan_fraction=0.2)...")
+        lif = LowInfoFilter(max_nan_fraction=0.2)
+        lif.fit(X_sel)
+        X_sel_np = lif.transform(X_sel)
+        # Reconstruct DataFrame
+        if hasattr(lif, "get_feature_names_out"):
+                cols = lif.get_feature_names_out()
+        else:
+                # Fallback if get_feature_names_out not available or fails
+                cols = X_sel.columns[lif.get_support()]
+        
+        X_sel = pd.DataFrame(X_sel_np, index=X_sel.index, columns=cols)
+        print(f"       Features remaining: {X_sel.shape[1]}")
+
+        print(f"[INFO] Applying SimpleImputer (median)...")
+        imputer = SimpleImputer(strategy="median")
+        X_sel_np = imputer.fit_transform(X_sel)
+        X_sel = pd.DataFrame(X_sel_np, index=X_sel.index, columns=X_sel.columns)
+
+        print(f"[INFO] Applying StandardScaler...")
+        scaler = StandardScaler()
+        X_sel_np = scaler.fit_transform(X_sel)
+        X_sel = pd.DataFrame(X_sel_np, index=X_sel.index, columns=X_sel.columns)
+
+        # ---------------------------------------------------------
         # DATA LEAKAGE CHECK (Added from FIXED version)
         # ---------------------------------------------------------
         leakage_keywords = [
@@ -930,19 +961,71 @@ def run_pipeline(args):
     print(f"Verify Test Split: {X_test.shape[0]} samples")
 
     # ---------------------------------------------------------
-    # 4. Subset to Selected Features
+    # Preprocessing for Verification Data
     # ---------------------------------------------------------
-    # Ensure all selected features exist in Verify Data
-    missing_verify = set(selected_features) - set(X_verify.columns)
+    print("\n[INFO] Preprocessing Verify Data (Train/Test Split)...")
     
+    # 1. For Full Features Evaluation
+    # We work on copies to not affect the extraction of selected features later if we drop columns
+    X_train_full = X_train.copy()
+    X_test_full = X_test.copy()
+    
+    # LIF
+    print(f"       [Full] Applying LowInfoFilter (max_nan_fraction=0.2)...")
+    lif_full = LowInfoFilter(max_nan_fraction=0.2)
+    lif_full.fit(X_train_full)
+    
+    # Transform and keep DataFrame
+    cols_full = lif_full.get_feature_names_out() if hasattr(lif_full, "get_feature_names_out") else X_train_full.columns[lif_full.get_support()]
+    X_train_full = pd.DataFrame(lif_full.transform(X_train_full), index=X_train_full.index, columns=cols_full)
+    X_test_full = pd.DataFrame(lif_full.transform(X_test_full), index=X_test_full.index, columns=cols_full)
+    
+    # Imputer
+    print(f"       [Full] Applying SimpleImputer (median)...")
+    imputer_full = SimpleImputer(strategy="median")
+    X_train_full = pd.DataFrame(imputer_full.fit_transform(X_train_full), index=X_train_full.index, columns=X_train_full.columns)
+    X_test_full = pd.DataFrame(imputer_full.transform(X_test_full), index=X_test_full.index, columns=X_test_full.columns)
+
+    # Scaler
+    print(f"       [Full] Applying StandardScaler...")
+    scaler_full = StandardScaler()
+    X_train_full = pd.DataFrame(scaler_full.fit_transform(X_train_full), index=X_train_full.index, columns=X_train_full.columns)
+    X_test_full = pd.DataFrame(scaler_full.transform(X_test_full), index=X_test_full.index, columns=X_test_full.columns)
+
+    # 2. For Selected Features Evaluation
+    # We start from the raw split again
+    # Ensure all selected features exist
+    missing_verify = set(selected_features) - set(X_train.columns)
     if missing_verify:
         print(f"[WARNING] {len(missing_verify)} selected features missing in Verify Data. Filling with 0.")
         for f in missing_verify:
             X_train[f] = 0.0
             X_test[f] = 0.0
             
-    X_train_sub = X_train[selected_features]
-    X_test_sub = X_test[selected_features]
+    X_train_sub = X_train[selected_features].copy()
+    X_test_sub = X_test[selected_features].copy()
+    
+    print(f"       [Selected] Applying LowInfoFilter (max_nan_fraction=0.2)...")
+    lif_sub = LowInfoFilter(max_nan_fraction=0.2)
+    lif_sub.fit(X_train_sub)
+    
+    cols_sub = lif_sub.get_feature_names_out() if hasattr(lif_sub, "get_feature_names_out") else X_train_sub.columns[lif_sub.get_support()]
+    X_train_sub = pd.DataFrame(lif_sub.transform(X_train_sub), index=X_train_sub.index, columns=cols_sub)
+    X_test_sub = pd.DataFrame(lif_sub.transform(X_test_sub), index=X_test_sub.index, columns=cols_sub)
+    
+    print(f"       [Selected] Features remaining after LIF: {X_train_sub.shape[1]}/{len(selected_features)}")
+
+    # Imputer
+    print(f"       [Selected] Applying SimpleImputer (median)...")
+    imputer_sub = SimpleImputer(strategy="median")
+    X_train_sub = pd.DataFrame(imputer_sub.fit_transform(X_train_sub), index=X_train_sub.index, columns=X_train_sub.columns)
+    X_test_sub = pd.DataFrame(imputer_sub.transform(X_test_sub), index=X_test_sub.index, columns=X_test_sub.columns)
+
+    # Scaler
+    print(f"       [Selected] Applying StandardScaler...")
+    scaler_sub = StandardScaler()
+    X_train_sub = pd.DataFrame(scaler_sub.fit_transform(X_train_sub), index=X_train_sub.index, columns=X_train_sub.columns)
+    X_test_sub = pd.DataFrame(scaler_sub.transform(X_test_sub), index=X_test_sub.index, columns=X_test_sub.columns)
 
     # ---------------------------------------------------------
     # 5. Train Final Models (Selected vs Full)
@@ -998,7 +1081,7 @@ def run_pipeline(args):
 
     # 2. Evaluate on Full Features (Verify Data)
     # Note: This might be slow if verify data has many genes
-    evaluate_models(X_train, X_test, y_train_surv, y_test_surv, "Full")
+    evaluate_models(X_train_full, X_test_full, y_train_surv, y_test_surv, "Full")
 
     # ---------------------------------------------------------
     # 6. Save Results
