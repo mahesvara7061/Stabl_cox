@@ -1,0 +1,766 @@
+import os
+import argparse
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import sys
+import io
+import traceback
+import warnings
+import matplotlib.pyplot as plt
+
+# Local imports
+try:
+    from .stabl import Stabl, save_stabl_results
+    from .preprocessing import LowInfoFilter
+except ImportError:
+    # If running as script from stabl/ folder
+    sys.path.append(str(Path(__file__).parent.parent))
+    from stabl.stabl import Stabl, save_stabl_results
+    from stabl.preprocessing import LowInfoFilter
+
+from sksurv.linear_model import CoxPHSurvivalAnalysis, CoxnetSurvivalAnalysis
+from sksurv.ensemble import ComponentwiseGradientBoostingSurvivalAnalysis, RandomSurvivalForest
+from sksurv.metrics import (
+    concordance_index_censored,
+    concordance_index_ipcw,
+    cumulative_dynamic_auc,
+    integrated_brier_score,
+    brier_score
+)
+from sksurv.util import Surv
+from sksurv.nonparametric import kaplan_meier_estimator
+from joblib import Parallel, delayed
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+
+# Thêm thư viện lifelines cho phân tích đơn biến
+try:
+    from lifelines import CoxPHFitter, KaplanMeierFitter
+    from lifelines.statistics import logrank_test
+except ImportError:
+    print("[WARNING] Thư viện 'lifelines' chưa được cài đặt. Một số phân tích đơn biến sẽ bị bỏ qua.")
+    print("          Vui lòng cài đặt: pip install lifelines")
+
+# -------------------------------
+# Utils
+# -------------------------------
+
+def detect_sep(path):
+    """Try to guess separator: prefer tab if '\t' found in first 1KB."""
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        head = f.read(1024)
+    if "\t" in head and "," not in head:
+        return "\t"
+    if "\t" in head and "," in head:
+        return "\t"
+    return ","
+
+
+def load_counts(counts_path, num_genes: int | None = None, debug_dir: str | None = None):
+    """
+    Read counts: first 2 columns = gene_name, entrez_id; remaining columns = samples.
+    """
+    sep = detect_sep(counts_path)
+    df = pd.read_csv(counts_path, sep=sep, header=0)
+    if df.shape[1] < 4:
+        raise ValueError("File counts must have >= 4 columns (gene, entrez, and >=2 samples).")
+
+    gene_col = df.columns[0]
+    sample_cols = df.columns[2:]
+
+    # Build deterministic gene order
+    genes_in_order = pd.Index(df[gene_col].astype(str).tolist())
+    first_occ_mask = ~genes_in_order.duplicated()
+    unique_genes_in_order = genes_in_order[first_occ_mask]
+
+    # Matrix genes x samples
+    expr = df[sample_cols].copy()
+    expr.index = df[gene_col].astype(str).values
+    
+    if expr.index.duplicated().any():
+        if debug_dir:
+            try:
+                os.makedirs(debug_dir, exist_ok=True)
+                dup_genes = expr.index[expr.index.duplicated()].unique()
+                pd.Series(dup_genes, name="Duplicated_Genes").to_csv(Path(debug_dir) / "duplicated_genes.csv", index=False)
+            except Exception:
+                pass
+
+    # Aggregate duplicates by median WITHOUT sorting
+    expr = expr.groupby(expr.index, sort=False).median()
+
+    # Reindex to first-appearance order
+    expr = expr.reindex(unique_genes_in_order.intersection(expr.index))
+
+    # Cap to first N genes if requested
+    if num_genes is not None:
+        expr = expr.iloc[:num_genes, :]
+
+    # Transpose: samples x genes, coerce numeric
+    X = expr.T.apply(pd.to_numeric, errors="coerce")
+    return X
+
+
+def load_clinical(clinical_path):
+    """
+    Read clinical with columns: sample id, OS, censored.
+    Convention: censored = 0 (alive), 1 (dead) -> event=False/True.
+    """
+    sep = detect_sep(clinical_path)
+    clin = pd.read_csv(clinical_path, sep=sep, header=0)
+    clin.columns = [c.replace("\ufeff", "") for c in clin.columns]
+
+    ren = {c: c.strip().lower() for c in clin.columns}
+    clin = clin.rename(columns=ren)
+
+    col_map = {}
+    for cand in ["sample id", "sample_id", "sample", "id", "case_id", "patient_id", "case submitter id", "cgga_id"]:
+        if cand in clin.columns:
+            col_map["sample_id"] = cand
+            break
+    for cand in ["os", "time", "overall_survival", "overall survival", "survival_time", "survival time", "days_to_death", "days to death"]:
+        if cand in clin.columns:
+            col_map["time"] = cand
+            break
+    for cand in ["censored", "censor", "status", "event", "vital_status", "vital status"]:
+        if cand in clin.columns:
+            col_map["censored"] = cand
+            break
+
+    if set(col_map.keys()) != {"sample_id", "time", "censored"}:
+        raise ValueError(f"Cannot find all required columns. Mapped: {col_map}")
+
+    sid_raw = clin[col_map["sample_id"]].astype(str)
+    time_raw = clin[col_map["time"]]
+    cens_raw = clin[col_map["censored"]]
+
+    time_str = (time_raw.astype(str)
+                .str.replace(r"[^0-9\.,\-]", "", regex=True)
+                .str.replace(",", ".", regex=False)
+               )
+    time = pd.to_numeric(time_str, errors="coerce")
+
+    cens_str = cens_raw.astype(str).str.strip().str.lower()
+    text_map = {
+        "alive": "0", "censored": "0", "living": "0", "no_event": "0", "no event": "0",
+        "dead": "1", "deceased": "1", "event": "1", "died": "1",
+        "0.0": "0", "1.0": "1"
+    }
+    cens_norm = cens_str.map(lambda x: text_map.get(x, x))
+    cens = pd.to_numeric(cens_norm, errors="coerce")
+    event = (cens == 1).astype("boolean")
+
+    sid_idx = pd.Index(sid_raw.astype(str).to_numpy(), name="sample_id")
+    y = pd.DataFrame({"time":  time.to_numpy(), "event": event.to_numpy()}, index=sid_idx)
+
+    if y.index.duplicated().any():
+        y = y[~y.index.duplicated(keep="first")]
+
+    y = y.dropna(subset=["time", "event"])
+    return y
+
+
+def align_X_y(X, y):
+    inter = X.index.astype(str).intersection(y.index.astype(str))
+    X2 = X.loc[inter].sort_index()
+    y2 = y.loc[inter].sort_index()
+    mask = (~y2['time'].isna()) & (~y2['event'].isna())
+    X2 = X2.loc[mask]
+    y2 = y2.loc[mask]
+    return X2, y2
+
+
+def run_univariate_cox(X, y, p_thresh=0.05, debug_dir=None):
+    print(f"[INFO] Running univariate Cox selection (p < {p_thresh})...")
+    try:
+        from lifelines import CoxPHFitter
+    except ImportError:
+        return X
+
+    genes = X.columns
+    times = y['time'].values
+    events = y['event'].values.astype(int)
+    
+    def fit_one_gene(gene, values):
+        try:
+            df = pd.DataFrame({'feature': values, 'T': times, 'E': events}).dropna()
+            if df['feature'].nunique() < 2: return (gene, 1.0)
+            cph = CoxPHFitter()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cph.fit(df, duration_col='T', event_col='E')
+            return (gene, cph.summary.loc['feature', 'p'])
+        except Exception:
+            return (gene, 1.0)
+
+    results = Parallel(n_jobs=-1, verbose=5)(delayed(fit_one_gene)(g, X[g].values) for g in genes)
+    res_df = pd.DataFrame(results, columns=['gene', 'p_value'])
+    
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        res_df.to_csv(Path(debug_dir) / "univariate_cox_results.csv", index=False)
+        
+    selected = res_df[res_df['p_value'] < p_thresh]['gene'].tolist()
+    print(f"[INFO] Univariate Cox: {len(selected)}/{len(genes)} features passed p < {p_thresh}")
+    if len(selected) == 0: return X
+    return X[selected]
+
+# -------------------------------
+# NEW: Comprehensive Evaluation Functions
+# -------------------------------
+
+def evaluate_survival_model_comprehensive(model, X_train, y_train, X_test, y_test, model_name, outdir):
+    """
+    Đánh giá toàn diện mô hình sinh tồn (Đã sửa lỗi version scikit-survival)
+    """
+    results = {}
+    out_path = Path(outdir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n--- Đánh giá nâng cao cho: {model_name} ---")
+
+    # Dự đoán Risk Score
+    try:
+        risk_scores = model.predict(X_test)
+    except Exception as e:
+        print(f"[WARN] Không thể dự đoán risk score cho {model_name}: {e}")
+        return results
+
+    # --- 1. Harrell's C-index ---
+    try:
+        harrell_c = concordance_index_censored(y_test["event"], y_test["time"], risk_scores)[0]
+        results["Harrell_C"] = harrell_c
+        print(f"   >> Harrell's C-index: {harrell_c:.4f}")
+    except Exception as e:
+        results["Harrell_C"] = np.nan
+
+    # --- 2. Uno's C-index ---
+    # Uno C yêu cầu tau phải nhỏ hơn thời gian lớn nhất của cả train và test
+    tau = min(y_test["time"].max(), y_train["time"].max()) - 1e-5
+    try:
+        uno_c, _, _, _, _ = concordance_index_ipcw(y_train, y_test, risk_scores, tau=tau)
+        print(f"   >> Uno's C-index: {uno_c:.4f}")
+        results["Uno_C_Index"] = uno_c
+    except Exception as e:
+        print(f"   >> Lỗi tính Uno's C: {e}")
+        results["Uno_C_Index"] = np.nan
+
+    # --- 3. Brier Score & IBS ---
+    if hasattr(model, "predict_survival_function"):
+        try:
+            survs = model.predict_survival_function(X_test)
+            
+            # --- [FIX QUAN TRỌNG] ---
+            # Xác định các mốc thời gian để tính Brier
+            # Lower bound: Bắt đầu từ thời điểm sớm nhất của Test set (không cần phụ thuộc Train set vì G(t)=1 tại t=0)
+            lower = y_test["time"].min()
+            if lower <= 0: lower = 1e-5 # Time must be positive
+            
+            # Upper bound: Bị giới hạn bởi thời gian theo dõi lớn nhất của Train set (để tính được IPCW)
+            upper = min(y_test["time"].max(), y_train["time"].max()) - 1e-5
+            
+            if lower >= upper:
+                print(f"   >> [WARN] Không thể tính IBS: Valid time range is empty (Lower: {lower}, Upper: {upper})")
+                results["IBS"] = np.nan
+            else:
+                times_brier = np.linspace(lower, upper, 100)
+                
+                # Thay vì truyền 'survs' (object), ta tính giá trị cụ thể tại times_brier
+                # Tạo ma trận (n_samples, n_times)
+                preds = np.row_stack([fn(times_brier) for fn in survs])
+                
+                # Bây giờ truyền ma trận số thực 'preds' vào thay vì 'survs'
+                ibs = integrated_brier_score(y_train, y_test, preds, times_brier)
+                print(f"   >> Integrated Brier Score (IBS): {ibs:.4f} (Thấp là tốt)")
+                results["IBS"] = ibs
+                
+                # Vẽ Prediction Error Curve
+                times_plot, brier_scores_vals = brier_score(y_train, y_test, preds, times_brier)
+                
+                plt.figure(figsize=(8, 6))
+                plt.plot(times_plot, brier_scores_vals, color="purple", lw=2, label=f"IBS = {ibs:.3f}")
+                plt.axhline(0.25, color="gray", linestyle="--", alpha=0.5, label="Random (0.25)")
+                plt.xlabel("Time (Days)")
+                plt.ylabel("Brier Score (Prediction Error)")
+                plt.title(f"{model_name}: Prediction Error Curve")
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                plt.savefig(out_path / f"{model_name}_brier_score_plot.png")
+                plt.close()
+            
+        except Exception as e:
+            print(f"   >> Lỗi tính Brier/IBS: {e}")
+            import traceback
+            traceback.print_exc()
+            results["IBS"] = np.nan
+    else:
+        print(f"   >> Model {model_name} không hỗ trợ predict_survival_function -> Bỏ qua IBS.")
+
+    # --- 4. Time-dependent AUC ---
+    try:
+        # Chọn các mốc thời gian từ percentile 10 đến 90 của tập TEST
+        times_auc = np.percentile(y_test["time"], np.linspace(10, 90, 15))
+        # Lọc bỏ các mốc thời gian vượt quá train set (nếu có) để tránh lỗi
+        times_auc = times_auc[times_auc < y_train["time"].max()]
+        
+        auc_vals, mean_auc = cumulative_dynamic_auc(y_train, y_test, risk_scores, times_auc)
+        
+        plt.figure(figsize=(8, 6))
+        plt.plot(times_auc, auc_vals, "o-", color="blue", label=f"Mean AUC = {mean_auc:.3f}")
+        plt.axhline(0.5, color="red", linestyle="--", label="Random (0.5)")
+        plt.xlabel("Time (Days)")
+        plt.ylabel("Time-dependent AUC")
+        plt.title(f"{model_name}: Time-dependent AUC")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.ylim(0.0, 1.0) # Mở rộng y-lim để nhìn rõ nếu AUC thấp
+        plt.savefig(out_path / f"{model_name}_time_dependent_auc.png")
+        plt.close()
+        results["Mean_Time_AUC"] = mean_auc
+    except Exception as e:
+        print(f"   >> Lỗi vẽ Time-dependent AUC: {e}")
+
+    # --- 5. Kaplan-Meier Risk Stratification ---
+    try:
+        median_risk = np.median(risk_scores)
+        high_risk_mask = risk_scores > median_risk
+        
+        plt.figure(figsize=(8, 6))
+        
+        # SỬA LỖI UNPACK: kaplan_meier_estimator chỉ trả về 2 giá trị
+        # Low Risk
+        time_L, surv_L = kaplan_meier_estimator(
+            y_test["event"][~high_risk_mask], y_test["time"][~high_risk_mask]
+        )
+        plt.step(time_L, surv_L, where="post", label="Low Risk", color="green", lw=2)
+        
+        # High Risk
+        time_H, surv_H = kaplan_meier_estimator(
+            y_test["event"][high_risk_mask], y_test["time"][high_risk_mask]
+        )
+        plt.step(time_H, surv_H, where="post", label="High Risk", color="red", lw=2)
+
+        # Log-rank test
+        if 'logrank_test' in globals():
+            lr = logrank_test(
+                y_test["time"][high_risk_mask], y_test["time"][~high_risk_mask],
+                y_test["event"][high_risk_mask], y_test["event"][~high_risk_mask]
+            )
+            plt.title(f"{model_name}: Risk Stratification (Log-rank p={lr.p_value:.4f})")
+        else:
+            plt.title(f"{model_name}: Kaplan-Meier Risk Stratification")
+
+        plt.xlabel("Time (Days)")
+        plt.ylabel("Survival Probability")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.savefig(out_path / f"{model_name}_km_risk_groups.png")
+        plt.close()
+    except Exception as e:
+        print(f"   >> Lỗi vẽ KM Stratification: {e}")
+
+    return results
+
+
+def analyze_individual_genes(X, y, selected_features, outdir):
+    """
+    Phân tích chi tiết từng gene được chọn:
+    1. Univariate Cox Regression (HR, CI, p-value)
+    2. Kaplan-Meier Plot (High vs Low expression)
+    """
+    if 'CoxPHFitter' not in globals():
+        print("[WARNING] Không có thư viện lifelines. Bỏ qua phân tích từng gene.")
+        return
+
+    print(f"\n[INFO] Đang phân tích đơn biến cho {len(selected_features)} gene được chọn...")
+    out_path = Path(outdir) / "individual_genes_analysis"
+    out_path.mkdir(parents=True, exist_ok=True)
+    
+    results = []
+    
+    # Chuẩn bị dữ liệu cho lifelines
+    df_analysis = X[selected_features].copy()
+    df_analysis['T'] = y['time'].values
+    df_analysis['E'] = y['event'].astype(int).values
+    
+    for gene in selected_features:
+        # --- 1. Univariate Cox ---
+        try:
+            cph = CoxPHFitter()
+            # Chỉ lấy cột gene hiện tại + Time + Event
+            df_gene = df_analysis[[gene, 'T', 'E']].dropna()
+            cph.fit(df_gene, duration_col='T', event_col='E')
+            
+            summary = cph.summary.loc[gene]
+            hr = summary['exp(coef)']
+            lower_ci = summary['exp(coef) lower 95%']
+            upper_ci = summary['exp(coef) upper 95%']
+            p_val = summary['p']
+            
+            results.append({
+                "Gene": gene,
+                "Hazard_Ratio": hr,
+                "CI_Lower": lower_ci,
+                "CI_Upper": upper_ci,
+                "P_value": p_val,
+                "Role": "Risk (Hại)" if hr > 1 else "Protective (Lợi)"
+            })
+        except Exception as e:
+            print(f"Lỗi tính Cox cho {gene}: {e}")
+
+        # --- 2. Kaplan-Meier Plot (High vs Low) ---
+        try:
+            median_val = df_gene[gene].median()
+            high_mask = df_gene[gene] > median_val
+            
+            kmf_high = KaplanMeierFitter()
+            kmf_low = KaplanMeierFitter()
+            
+            plt.figure(figsize=(6, 4))
+            ax = plt.subplot(111)
+            
+            kmf_high.fit(df_gene['T'][high_mask], event_observed=df_gene['E'][high_mask], label=f"High {gene}")
+            kmf_high.plot_survival_function(ax=ax, color='red')
+            
+            kmf_low.fit(df_gene['T'][~high_mask], event_observed=df_gene['E'][~high_mask], label=f"Low {gene}")
+            kmf_low.plot_survival_function(ax=ax, color='green')
+            
+            lr_result = logrank_test(
+                df_gene['T'][high_mask], df_gene['T'][~high_mask],
+                df_gene['E'][high_mask], df_gene['E'][~high_mask]
+            )
+            
+            plt.title(f"{gene}: High vs Low (p={lr_result.p_value:.4f})")
+            plt.ylabel("Survival Probability")
+            plt.xlabel("Time")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(out_path / f"KM_{gene}.png")
+            plt.close()
+            
+        except Exception as e:
+            print(f"Lỗi vẽ KM cho {gene}: {e}")
+
+    # --- 3. Lưu bảng tổng hợp ---
+    if results:
+        res_df = pd.DataFrame(results)
+        res_df = res_df.sort_values("P_value")
+        save_path = Path(outdir) / "univariate_analysis_selected_genes.csv"
+        res_df.to_csv(save_path, index=False)
+        print(f"[DONE] Đã lưu phân tích đơn biến tại: {save_path}")
+        print(res_df.to_string())
+
+# -------------------------------
+# Main Pipeline
+# -------------------------------
+
+def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None, model_type="coxnet"):
+    if model_type == "coxnet":
+        lambda_grid = "auto"
+        base = CoxnetSurvivalAnalysis(l1_ratio=0.9, fit_baseline_model=True, alpha_min_ratio=0.01, max_iter=1000000, tol=1e-7)
+    elif model_type == "gradient_boosting":
+        base = ComponentwiseGradientBoostingSurvivalAnalysis(loss="coxph", random_state=random_state)
+        lambda_grid = {"n_estimators": np.arange(10, 200, 20)} 
+    elif model_type == "rsf":
+        base = RandomSurvivalForest(n_estimators=100, min_samples_split=10, max_depth=10, max_features="sqrt", n_jobs=-1, random_state=random_state)
+        lambda_grid = {"min_samples_leaf": np.arange(2, 22, 2)}
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+    stabl_cox = Stabl(
+        base_estimator=base,
+        lambda_grid=lambda_grid,
+        n_bootstraps=n_bootstraps,
+        artificial_type="knockoff",
+        artificial_proportion=1,
+        sample_fraction=0.5,
+        replace=False,
+        bootstrap_threshold="median",
+        fdr_threshold_range=np.arange(0.05, 1.01, 0.05),
+        explore=True,
+        n_explore=5,
+        task_type="survival",
+        random_state=random_state,
+        n_jobs=-1,
+        verbose=1,
+        debug_dir=debug_dir
+    )
+    return stabl_cox
+
+
+def run_pipeline(args):
+    os.makedirs(args.outdir, exist_ok=True)
+    selected_features = []
+
+    if args.selected_features_file:
+        print(f"\n[INFO] Skipping Selection. Loading features from {args.selected_features_file}...")
+        try:
+            sf_df = pd.read_csv(args.selected_features_file)
+            if "Selected_Features" in sf_df.columns:
+                selected_features = sf_df["Selected_Features"].tolist()
+            else:
+                selected_features = sf_df.iloc[:, 0].tolist()
+            print(f"[INFO] Loaded {len(selected_features)} features from file.")
+        except Exception as e:
+            print(f"[ERROR] Failed to load selected features from file: {e}")
+            return
+    else:
+        # ---------------------------------------------------------
+        # 1. Load Selection Data
+        # ---------------------------------------------------------
+        print("\n[STEP 1] Loading Selection Data...")
+        X_sel = load_counts(args.selection_counts, num_genes=args.num_genes, debug_dir=args.debug_dir)
+        y_sel = load_clinical(args.selection_clinical)
+        X_sel, y_sel = align_X_y(X_sel, y_sel)
+        
+        # Preprocessing
+        print(f"[INFO] Applying LowInfoFilter (max_nan_fraction=0.2)...")
+        lif = LowInfoFilter(max_nan_fraction=0.2)
+        lif.fit(X_sel)
+        X_sel_np = lif.transform(X_sel)
+        cols = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_sel.columns[lif.get_support()]
+        X_sel = pd.DataFrame(X_sel_np, index=X_sel.index, columns=cols)
+        
+        imputer = SimpleImputer(strategy="median")
+        X_sel = pd.DataFrame(imputer.fit_transform(X_sel), index=X_sel.index, columns=X_sel.columns)
+        scaler = StandardScaler()
+        X_sel = pd.DataFrame(scaler.fit_transform(X_sel), index=X_sel.index, columns=X_sel.columns)
+
+        # Drop leakage
+        leakage_keywords = ["os", "time", "overall_survival", "censored", "event", "status"]
+        to_drop = [c for c in X_sel.columns if any(k in str(c).lower() for k in leakage_keywords)]
+        if to_drop: X_sel = X_sel.drop(columns=to_drop)
+
+        if args.univariate_cox:
+            X_sel = run_univariate_cox(X_sel, y_sel, p_thresh=args.univariate_p, debug_dir=args.debug_dir)
+
+        # ---------------------------------------------------------
+        # 2. Run STABL Feature Selection
+        # ---------------------------------------------------------
+        print("\n[STEP 2] Running STABL Feature Selection...")
+        stabl_cox = build_stabl_cox(n_bootstraps=args.n_boot, random_state=args.seed, debug_dir=args.debug_dir, model_type=args.model_type)
+        stabl_cox.fit(X_sel, y_sel)
+        
+        selected_mask = stabl_cox.get_support()
+        if hasattr(stabl_cox, "feature_names_in_"):
+            selected_features = stabl_cox.feature_names_in_[selected_mask]
+        else:
+            selected_features = X_sel.columns[selected_mask]
+            
+        print(f"[INFO] STABL selected {len(selected_features)} features: {list(selected_features)}")
+        pd.Series(selected_features, name="Selected_Features").to_csv(Path(args.outdir) / "selected_features.csv", index=False)
+        try:
+            save_stabl_results(stabl_cox, Path(args.outdir), X_sel, y_sel, task_type="survival")
+        except Exception: pass
+
+    if len(selected_features) == 0:
+        print("[ERROR] No features selected. Cannot proceed to training.")
+        return
+
+    # ---------------------------------------------------------
+    # 3. Load Verify Data and Split
+    # ---------------------------------------------------------
+    print("\n[STEP 3] Loading Verify Data and Splitting...")
+    X_verify = load_counts(args.verify_counts, num_genes=args.num_genes, debug_dir=args.debug_dir) 
+    y_verify = load_clinical(args.verify_clinical)
+    X_verify, y_verify = align_X_y(X_verify, y_verify)
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_verify, y_verify, test_size=args.verify_split_ratio, random_state=args.seed, stratify=y_verify['event']
+    )
+    
+    # ---------------------------------------------------------
+    # 4. Analyze Individual Genes (on Verify Train Set to avoid leakage)
+    # ---------------------------------------------------------
+    print("\n[STEP 4] Analyzing Individual Selected Genes...")
+    # Preprocess X_train for analysis (just basic imputation/scaling, no selection)
+    X_train_analyze = X_train[selected_features].copy()
+    X_train_analyze = X_train_analyze.fillna(X_train_analyze.median())
+    
+    # Gọi hàm phân tích từng gene
+    analyze_individual_genes(X_train_analyze, y_train, selected_features, args.outdir)
+
+    # ---------------------------------------------------------
+    # 5. Preprocessing for Final Models
+    # ---------------------------------------------------------
+    print("\n[STEP 5] Preprocessing and Training Final Models...")
+    
+    # Helper to preprocess
+    def preprocess_data(X_tr, X_te, features=None):
+        if features is not None:
+            # Fill missing features with 0
+            missing = set(features) - set(X_tr.columns)
+            for f in missing: X_tr[f] = 0.0
+            missing = set(features) - set(X_te.columns)
+            for f in missing: X_te[f] = 0.0
+            X_tr = X_tr[features]
+            X_te = X_te[features]
+            
+        lif = LowInfoFilter(max_nan_fraction=0.2)
+        X_tr_np = lif.fit_transform(X_tr)
+        cols = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_tr.columns[lif.get_support()]
+        X_te_np = lif.transform(X_te)
+        
+        X_tr = pd.DataFrame(X_tr_np, index=X_tr.index, columns=cols)
+        X_te = pd.DataFrame(X_te_np, index=X_te.index, columns=cols)
+        
+        imputer = SimpleImputer(strategy="median")
+        X_tr = pd.DataFrame(imputer.fit_transform(X_tr), index=X_tr.index, columns=X_tr.columns)
+        X_te = pd.DataFrame(imputer.transform(X_te), index=X_te.index, columns=X_te.columns)
+        
+        scaler = StandardScaler()
+        X_tr = pd.DataFrame(scaler.fit_transform(X_tr), index=X_tr.index, columns=X_tr.columns)
+        X_te = pd.DataFrame(scaler.transform(X_te), index=X_te.index, columns=X_te.columns)
+        return X_tr, X_te
+
+    # 1. Selected Features Data
+    X_train_sub, X_test_sub = preprocess_data(X_train.copy(), X_test.copy(), features=selected_features)
+    # 2. Full Features Data
+    print("[INFO] Processing Full Features Data (this might take a while)...")
+    X_train_full, X_test_full = preprocess_data(X_train.copy(), X_test.copy())
+
+    # Structured arrays for sksurv
+    y_train_surv = Surv.from_arrays(event=y_train['event'].astype(bool).values, time=y_train['time'].values)
+    y_test_surv = Surv.from_arrays(event=y_test['event'].astype(bool).values, time=y_test['time'].values)
+
+    def get_models(seed):
+        return {
+            "CoxPH": CoxPHSurvivalAnalysis(),
+            "Coxnet": CoxnetSurvivalAnalysis(l1_ratio=0.9, alpha_min_ratio=0.01, fit_baseline_model=True),
+            "GradientBoosting": ComponentwiseGradientBoostingSurvivalAnalysis(loss="coxph", random_state=seed),
+            "RSF": RandomSurvivalForest(n_estimators=100, min_samples_split=10, min_samples_leaf=15, max_features="sqrt", n_jobs=-1, random_state=seed)
+        }
+
+    results_list = []
+
+    # --- 1. Evaluate on SELECTED Features ---
+    print(f"\n--- Evaluating Models on SELECTED Features ({X_train_sub.shape[1]} features) ---")
+    models_sub = get_models(args.seed)
+    for name, model in models_sub.items():
+        if name == "CoxPH" and X_train_sub.shape[1] > X_train_sub.shape[0]:
+            print(f"Skipping {name} (p > n)")
+            continue
+            
+        try:
+            model.fit(X_train_sub, y_train_surv)
+            
+            # --- GỌI HÀM ĐÁNH GIÁ NÂNG CAO ---
+            eval_res = evaluate_survival_model_comprehensive(
+                model, X_train_sub, y_train_surv, X_test_sub, y_test_surv, 
+                model_name=f"{name}_Selected", outdir=args.outdir
+            )
+            
+            res_entry = {
+                "Feature_Set": "Selected",
+                "Model": name,
+                "Num_Features": X_train_sub.shape[1]
+            }
+            res_entry.update(eval_res)
+            results_list.append(res_entry)
+
+        except Exception as e:
+            print(f"[{name}] Failed on Selected Features: {e}")
+            traceback.print_exc()
+
+    # --- 2. Evaluate on FULL Features ---
+    print(f"\n--- Evaluating Models on FULL Features ({X_train_full.shape[1]} features) ---")
+    models_full = get_models(args.seed)
+    for name, model in models_full.items():
+        if name == "CoxPH" and X_train_full.shape[1] > X_train_full.shape[0]:
+            print(f"Skipping {name} on Full Features (p > n)")
+            continue
+
+        try:
+            print(f"Training {name} on Full Features...")
+            model.fit(X_train_full, y_train_surv)
+            
+            eval_res = evaluate_survival_model_comprehensive(
+                model, X_train_full, y_train_surv, X_test_full, y_test_surv, 
+                model_name=f"{name}_Full", outdir=args.outdir
+            )
+            
+            res_entry = {
+                "Feature_Set": "Full",
+                "Model": name,
+                "Num_Features": X_train_full.shape[1]
+            }
+            res_entry.update(eval_res)
+            results_list.append(res_entry)
+
+        except Exception as e:
+            print(f"[{name}] Failed on Full Features: {e}")
+
+    # ---------------------------------------------------------
+    # 6. Save Final Results
+    # ---------------------------------------------------------
+    print("\n[STEP 6] Saving Final Comparison...")
+    res_df = pd.DataFrame(results_list)
+    res_df.to_csv(Path(args.outdir) / "final_model_comparison.csv", index=False)
+    print(res_df)
+    print(f"\n[DONE] Results saved to {args.outdir}")
+
+
+def main(args):
+    log_buffer = None
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    if args.debug_dir:
+        os.makedirs(args.debug_dir, exist_ok=True)
+        log_buffer = io.StringIO()
+        class Tee(object):
+            def __init__(self, stream, buffer):
+                self.stream = stream
+                self.buffer = buffer
+            def write(self, message):
+                self.stream.write(message)
+                self.buffer.write(message)
+            def flush(self):
+                self.stream.flush()
+            def fileno(self): return self.stream.fileno()
+        sys.stdout = Tee(original_stdout, log_buffer)
+        sys.stderr = Tee(original_stderr, log_buffer)
+
+    try:
+        run_pipeline(args)
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted.")
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        traceback.print_exc()
+    finally:
+        if log_buffer:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            try:
+                with open(Path(args.debug_dir) / "run_log.txt", "w", encoding="utf-8") as f:
+                    f.write(log_buffer.getvalue())
+            except Exception: pass
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run STABL Cox: Selection on one dataset, Verify on another (split internally) - FIXED VERSION")
+    
+    # Selection Data
+    parser.add_argument("--selection_counts", required=True, help="Path to counts file for Feature Selection")
+    parser.add_argument("--selection_clinical", required=True, help="Path to clinical file for Feature Selection")
+    
+    # Verify Data (To be split)
+    parser.add_argument("--verify_counts", required=True, help="Path to counts file for Verification")
+    parser.add_argument("--verify_clinical", required=True, help="Path to clinical file for Verification")
+    parser.add_argument("--verify_split_ratio", type=float, default=0.3, help="Ratio of Verify data to use for Testing (default: 0.3)")
+    
+    parser.add_argument("--outdir", required=True, help="Output directory")
+    parser.add_argument("--n_boot", type=int, default=200, help="Number of bootstraps for STABL")
+    parser.add_argument("--seed", type=int, default=42, help="random_state")
+    parser.add_argument("--num_genes", type=int, default=None, help="Keep only the first N genes in file order (for Selection data).")
+    parser.add_argument("--debug_dir", type=str, default=None, help="Directory to save debug info")
+    parser.add_argument("--model_type", type=str, default="coxnet", choices=["coxnet", "gradient_boosting", "rsf"], help="Base estimator type")
+    parser.add_argument("--univariate_cox", action="store_true", help="Run univariate Cox selection before Stabl")
+    parser.add_argument("--univariate_p", type=float, default=0.05, help="P-value threshold for univariate Cox")
+    parser.add_argument("--selected_features_file", type=str, default=None, help="Path to file containing selected features (skip selection step)")
+
+    args = parser.parse_args()
+    main(args)
