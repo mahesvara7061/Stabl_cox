@@ -1010,10 +1010,34 @@ def fit_bootstrapped_sample(
     except Exception:
         # --- Fallback: tự dựng mask từ coef_/feature_importances_ rồi ép chiều ---
         coef = None
-        if hasattr(base_estimator, "coef_") and base_estimator.coef_ is not None:
-            coef = np.ravel(base_estimator.coef_)
-        elif hasattr(base_estimator, "feature_importances_"):
-            coef = np.ravel(base_estimator.feature_importances_)
+        
+        # Try coef_
+        try:
+            if hasattr(base_estimator, "coef_") and base_estimator.coef_ is not None:
+                coef = np.ravel(base_estimator.coef_)
+        except (AttributeError, NotImplementedError):
+            pass
+
+        # Try feature_importances_
+        if coef is None:
+            try:
+                # Note: hasattr might raise NotImplementedError for RSF
+                if hasattr(base_estimator, "feature_importances_"):
+                    coef = np.ravel(base_estimator.feature_importances_)
+            except (AttributeError, NotImplementedError):
+                pass
+        
+        # Try permutation_importance as last resort (e.g. for RandomSurvivalForest)
+        if coef is None:
+            try:
+                from sklearn.inspection import permutation_importance
+                # Run on training data (bootstrap sample) for proxy importance
+                result = permutation_importance(
+                    base_estimator, X, y, n_repeats=1, random_state=None
+                )
+                coef = result.importances_mean
+            except Exception:
+                pass
 
         if coef is None:
             # Bó tay: chọn none để không làm vstack lỗi
