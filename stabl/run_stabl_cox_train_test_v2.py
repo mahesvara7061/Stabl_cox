@@ -7,7 +7,11 @@ import sys
 import io
 import traceback
 import warnings
+import re
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
 
 # Local imports
 try:
@@ -364,7 +368,7 @@ def evaluate_survival_model_comprehensive(model, X_train, y_train, X_test, y_tes
     return results
 
 
-def analyze_individual_genes(X, y, selected_features, outdir):
+def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
     """
     Phân tích chi tiết từng gene được chọn:
     1. Univariate Cox Regression (HR, CI, p-value)
@@ -374,18 +378,32 @@ def analyze_individual_genes(X, y, selected_features, outdir):
         print("[WARNING] Không có thư viện lifelines. Bỏ qua phân tích từng gene.")
         return
 
-    print(f"\n[INFO] Đang phân tích đơn biến cho {len(selected_features)} gene được chọn...")
-    out_path = Path(outdir) / "individual_genes_analysis"
+    label_str = f" ({dataset_label})" if dataset_label else ""
+    print(f"\n[INFO] Đang phân tích đơn biến{label_str} cho {len(selected_features)} gene được chọn...")
+    
+    folder_name = "individual_genes_analysis"
+    csv_name = "univariate_analysis_selected_genes.csv"
+    
+    if dataset_label:
+        folder_name += f"_{dataset_label}"
+        csv_name = re.sub(r"\.csv$", f"_{dataset_label}.csv", csv_name)
+
+    out_path = Path(outdir) / folder_name
     out_path.mkdir(parents=True, exist_ok=True)
     
     results = []
     
     # Chuẩn bị dữ liệu cho lifelines
-    df_analysis = X[selected_features].copy()
+    # Ensure X has the selected features (handle missing if any)
+    available_feats = [f for f in selected_features if f in X.columns]
+    if len(available_feats) < len(selected_features):
+        print(f"[WARN] Có {len(selected_features)-len(available_feats)} features bị thiếu trong dataset này.")
+    
+    df_analysis = X[available_feats].copy()
     df_analysis['T'] = y['time'].values
     df_analysis['E'] = y['event'].astype(int).values
     
-    for gene in selected_features:
+    for gene in available_feats:
         # --- 1. Univariate Cox ---
         try:
             cph = CoxPHFitter()
@@ -447,9 +465,9 @@ def analyze_individual_genes(X, y, selected_features, outdir):
     if results:
         res_df = pd.DataFrame(results)
         res_df = res_df.sort_values("P_value")
-        save_path = Path(outdir) / "univariate_analysis_selected_genes.csv"
+        save_path = Path(outdir) / csv_name
         res_df.to_csv(save_path, index=False)
-        print(f"[DONE] Đã lưu phân tích đơn biến tại: {save_path}")
+        print(f"[DONE] Đã lưu phân tích đơn biến{label_str} tại: {save_path}")
         print(res_df.to_string())
 
 # -------------------------------
@@ -459,23 +477,24 @@ def analyze_individual_genes(X, y, selected_features, outdir):
 def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None, model_type="coxnet"):
     if model_type == "coxnet":
         lambda_grid = "auto"
-        base = CoxnetSurvivalAnalysis(l1_ratio=0.9, fit_baseline_model=True, alpha_min_ratio=0.01, max_iter=1000000, tol=1e-7)
+        base = CoxnetSurvivalAnalysis(l1_ratio=0.9, fit_baseline_model=True, alpha_min_ratio=0.01, max_iter=100000, tol=1e-7)
     elif model_type == "gradient_boosting":
         base = ComponentwiseGradientBoostingSurvivalAnalysis(loss="coxph", random_state=random_state)
-        lambda_grid = {"n_estimators": np.arange(10, 200, 20)} 
+        lambda_grid = {"n_estimators": np.arange(10, 210, 10)} 
     elif model_type == "rsf":
         base = RandomSurvivalForest(n_estimators=100, min_samples_split=10, max_depth=10, max_features="sqrt", n_jobs=-1, random_state=random_state)
         lambda_grid = {"min_samples_leaf": np.arange(2, 22, 2)}
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
+
     stabl_cox = Stabl(
         base_estimator=base,
         lambda_grid=lambda_grid,
         n_bootstraps=n_bootstraps,
         artificial_type="knockoff",
-        artificial_proportion=1,
-        sample_fraction=0.5,
+        artificial_proportion=1.0,
+        sample_fraction=0.8,
         replace=False,
         bootstrap_threshold="median",
         fdr_threshold_range=np.arange(0.05, 1.01, 0.05),
@@ -494,6 +513,32 @@ def run_pipeline(args):
     os.makedirs(args.outdir, exist_ok=True)
     selected_features = []
 
+    # ---------------------------------------------------------
+    # 1. Load Selection Data (Always load for analysis purpose)
+    # ---------------------------------------------------------
+    print("\n[STEP 1] Loading Selection Data...")
+    X_sel = load_counts(args.selection_counts, num_genes=args.num_genes, debug_dir=args.debug_dir)
+    y_sel = load_clinical(args.selection_clinical)
+    X_sel, y_sel = align_X_y(X_sel, y_sel)
+    
+    # Preprocessing
+    print(f"[INFO] Preprocessing Selection Data (LowInfoFilter, Impute, Scale)...")
+    lif = LowInfoFilter(max_nan_fraction=0.2)
+    lif.fit(X_sel)
+    X_sel_np = lif.transform(X_sel)
+    cols = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_sel.columns[lif.get_support()]
+    X_sel = pd.DataFrame(X_sel_np, index=X_sel.index, columns=cols)
+    
+    imputer = SimpleImputer(strategy="median")
+    X_sel = pd.DataFrame(imputer.fit_transform(X_sel), index=X_sel.index, columns=X_sel.columns)
+    scaler = StandardScaler()
+    X_sel = pd.DataFrame(scaler.fit_transform(X_sel), index=X_sel.index, columns=X_sel.columns)
+
+    # Drop leakage
+    leakage_keywords = ["os", "time", "overall_survival", "censored", "event", "status"]
+    to_drop = [c for c in X_sel.columns if any(k in str(c).lower() for k in leakage_keywords)]
+    if to_drop: X_sel = X_sel.drop(columns=to_drop)
+
     if args.selected_features_file:
         print(f"\n[INFO] Skipping Selection. Loading features from {args.selected_features_file}...")
         try:
@@ -507,32 +552,6 @@ def run_pipeline(args):
             print(f"[ERROR] Failed to load selected features from file: {e}")
             return
     else:
-        # ---------------------------------------------------------
-        # 1. Load Selection Data
-        # ---------------------------------------------------------
-        print("\n[STEP 1] Loading Selection Data...")
-        X_sel = load_counts(args.selection_counts, num_genes=args.num_genes, debug_dir=args.debug_dir)
-        y_sel = load_clinical(args.selection_clinical)
-        X_sel, y_sel = align_X_y(X_sel, y_sel)
-        
-        # Preprocessing
-        print(f"[INFO] Applying LowInfoFilter (max_nan_fraction=0.2)...")
-        lif = LowInfoFilter(max_nan_fraction=0.2)
-        lif.fit(X_sel)
-        X_sel_np = lif.transform(X_sel)
-        cols = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_sel.columns[lif.get_support()]
-        X_sel = pd.DataFrame(X_sel_np, index=X_sel.index, columns=cols)
-        
-        imputer = SimpleImputer(strategy="median")
-        X_sel = pd.DataFrame(imputer.fit_transform(X_sel), index=X_sel.index, columns=X_sel.columns)
-        scaler = StandardScaler()
-        X_sel = pd.DataFrame(scaler.fit_transform(X_sel), index=X_sel.index, columns=X_sel.columns)
-
-        # Drop leakage
-        leakage_keywords = ["os", "time", "overall_survival", "censored", "event", "status"]
-        to_drop = [c for c in X_sel.columns if any(k in str(c).lower() for k in leakage_keywords)]
-        if to_drop: X_sel = X_sel.drop(columns=to_drop)
-
         if args.univariate_cox:
             X_sel = run_univariate_cox(X_sel, y_sel, p_thresh=args.univariate_p, debug_dir=args.debug_dir)
 
@@ -559,28 +578,38 @@ def run_pipeline(args):
         print("[ERROR] No features selected. Cannot proceed to training.")
         return
 
+    # --- NEW: Analyze on Selection Dataset ---
+    print("\n[ANALYSIS] Analyzing Individual Genes on Selection Dataset...")
+    analyze_individual_genes(X_sel, y_sel, selected_features, args.outdir, dataset_label="selection_dataset")
+
     # ---------------------------------------------------------
-    # 3. Load Verify Data and Split
+    # 3. Load Verify Data
     # ---------------------------------------------------------
-    print("\n[STEP 3] Loading Verify Data and Splitting...")
+    print("\n[STEP 3] Loading Verify Data...")
     X_verify = load_counts(args.verify_counts, num_genes=args.num_genes, debug_dir=args.debug_dir) 
     y_verify = load_clinical(args.verify_clinical)
     X_verify, y_verify = align_X_y(X_verify, y_verify)
+
+    # 3a. Analyze on Entire Verify Dataset
+    print("\n[ANALYSIS] Analyzing Individual Genes on Entire Verify Dataset...")
+    X_verify_analyze = X_verify.copy()
     
+    # Fill missing columns if any feature from selection is missing in verify
+    missing_feats = [f for f in selected_features if f not in X_verify_analyze.columns]
+    if missing_feats:
+        print(f"[WARN] {len(missing_feats)} features missing in Verify dataset. Filling with 0.")
+        for f in missing_feats: X_verify_analyze[f] = 0.0
+        
+    X_verify_analyze = X_verify_analyze[selected_features].replace([np.inf, -np.inf], np.nan)
+    X_verify_analyze = X_verify_analyze.fillna(X_verify_analyze.median())
+    
+    analyze_individual_genes(X_verify_analyze, y_verify, selected_features, args.outdir, dataset_label="verify_entire_dataset")
+
+    # 3b. Split for Final Models
+    print(f"\n[STEP 3b] Splitting Verify Data (Test Ratio={args.verify_split_ratio})...")
     X_train, X_test, y_train, y_test = train_test_split(
         X_verify, y_verify, test_size=args.verify_split_ratio, random_state=args.seed, stratify=y_verify['event']
     )
-    
-    # ---------------------------------------------------------
-    # 4. Analyze Individual Genes (on Verify Train Set to avoid leakage)
-    # ---------------------------------------------------------
-    print("\n[STEP 4] Analyzing Individual Selected Genes...")
-    # Preprocess X_train for analysis (just basic imputation/scaling, no selection)
-    X_train_analyze = X_train[selected_features].copy()
-    X_train_analyze = X_train_analyze.fillna(X_train_analyze.median())
-    
-    # Gọi hàm phân tích từng gene
-    analyze_individual_genes(X_train_analyze, y_train, selected_features, args.outdir)
 
     # ---------------------------------------------------------
     # 5. Preprocessing for Final Models
@@ -709,6 +738,15 @@ def main(args):
     
     if args.debug_dir:
         os.makedirs(args.debug_dir, exist_ok=True)
+
+        # Save run parameters
+        import json
+        try:
+            with open(Path(args.debug_dir) / "run_params.json", "w") as f:
+                json.dump(vars(args), f, indent=4)
+        except Exception as e:
+            print(f"[WARN] Could not save run params: {e}")
+
         log_buffer = io.StringIO()
         class Tee(object):
             def __init__(self, stream, buffer):

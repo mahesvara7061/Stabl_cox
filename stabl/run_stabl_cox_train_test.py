@@ -767,7 +767,7 @@ def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None, model_typ
             verbose=0
         )
         # Gradient Boosting uses n_estimators as the regularization parameter
-        lambda_grid = {"n_estimators": np.arange(10, 200, 20)} 
+        lambda_grid = {"n_estimators": np.arange(100, 1100, 10)} 
         
     elif model_type == "rsf":
         base = RandomSurvivalForest(
