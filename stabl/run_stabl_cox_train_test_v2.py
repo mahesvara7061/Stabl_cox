@@ -163,6 +163,7 @@ def load_clinical(clinical_path):
         y = y[~y.index.duplicated(keep="first")]
 
     y = y.dropna(subset=["time", "event"])
+    print(f"[INFO] Loaded clinical data with {y.shape[0]} samples.")
     return y
 
 
@@ -493,7 +494,7 @@ def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None, model_typ
         lambda_grid=lambda_grid,
         n_bootstraps=n_bootstraps,
         artificial_type="knockoff",
-        artificial_proportion=1.0,
+        artificial_proportion=0.5,
         sample_fraction=0.8,
         replace=False,
         bootstrap_threshold="median",
