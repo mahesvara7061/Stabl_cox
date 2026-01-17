@@ -371,9 +371,9 @@ def evaluate_survival_model_comprehensive(model, X_train, y_train, X_test, y_tes
 
 def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
     """
-    Phân tích chi tiết từng gene được chọn:
+    Phân tích chi tiết từng gene được chọn + Biosignature (Risk Score form Multivariate Cox):
     1. Univariate Cox Regression (HR, CI, p-value)
-    2. Kaplan-Meier Plot (High vs Low expression)
+    2. Kaplan-Meier Plot (High vs Low expression) with detailed stats.
     """
     if 'CoxPHFitter' not in globals():
         print("[WARNING] Không có thư viện lifelines. Bỏ qua phân tích từng gene.")
@@ -394,7 +394,6 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
     
     results = []
     
-    # Chuẩn bị dữ liệu cho lifelines
     # Ensure X has the selected features (handle missing if any)
     available_feats = [f for f in selected_features if f in X.columns]
     if len(available_feats) < len(selected_features):
@@ -403,14 +402,102 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
     df_analysis = X[available_feats].copy()
     df_analysis['T'] = y['time'].values
     df_analysis['E'] = y['event'].astype(int).values
-    
+
+    # --- Helper: Plot KM with detailed stats ---
+    def plot_km_with_stats(data_values, name_for_plot, time_col, event_col, save_file, add_to_results=False):
+        try:
+            # 1. Median Split
+            median_val = np.median(data_values)
+            # High means > median
+            high_mask = data_values > median_val
+            
+            n_high = high_mask.sum()
+            n_low = (~high_mask).sum()
+            
+            if n_high == 0 or n_low == 0:
+                print(f"   >> [SKIP] Cannot split {name_for_plot} (High={n_high}, Low={n_low})")
+                return
+
+            # 2. Log-rank test
+            T_high, E_high = time_col[high_mask], event_col[high_mask]
+            T_low, E_low = time_col[~high_mask], event_col[~high_mask]
+            
+            lr_res = logrank_test(T_high, T_low, E_high, E_low)
+            p_logrank = lr_res.p_value
+
+            # 3. Binary Cox for HR (High vs Low)
+            # Feature "group": 1=High, 0=Low
+            # Note: We must suppress warnings for convergence if separation is perfect
+            df_bin = pd.DataFrame({'group': high_mask.astype(int), 'T': time_col, 'E': event_col})
+            cph_bin = CoxPHFitter()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cph_bin.fit(df_bin, duration_col='T', event_col='E')
+            
+            hr_high = cph_bin.summary.loc['group', 'exp(coef)']
+            lower_ci = cph_bin.summary.loc['group', 'exp(coef) lower 95%']
+            upper_ci = cph_bin.summary.loc['group', 'exp(coef) upper 95%']
+            p_hr = cph_bin.summary.loc['group', 'p']
+
+            if add_to_results:
+                results.append({
+                    "Gene": name_for_plot,
+                    "Hazard_Ratio": hr_high,
+                    "CI_Lower": lower_ci,
+                    "CI_Upper": upper_ci,
+                    "P_value": p_hr,
+                    "Role": "Biosignature"
+                })
+
+            # 4. Plot
+            plt.figure(figsize=(7, 6))
+            ax = plt.subplot(111)
+            
+            kmf_high = KaplanMeierFitter()
+            kmf_low = KaplanMeierFitter()
+            
+            # Plot High
+            kmf_high.fit(T_high, event_observed=E_high, label=f"High (n={n_high})")
+            kmf_high.plot_survival_function(ax=ax, color='red')
+            
+            # Plot Low
+            kmf_low.fit(T_low, event_observed=E_low, label=f"Low (n={n_low})")
+            kmf_low.plot_survival_function(ax=ax, color='green')
+            
+            # Construct Stats Text in REQUESTED format
+            stats_str = (
+                f"Log-rank p: {p_logrank:.2e}\n"
+                f"HR(High): {hr_high:.2f}\n"
+                f"p(HR): {p_hr:.2e}\n"
+                f"n(High)={n_high}, n(Low)={n_low}"
+            )
+            
+            ax.add_artist(plt.legend(loc='best')) 
+            
+            # Add the stats box (bottom left or best corner)
+            ax.text(0.02, 0.05, stats_str, transform=ax.transAxes, fontsize=10,
+                    verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+
+            plt.title(f"{name_for_plot}")
+            plt.ylabel("Survival Probability")
+            plt.xlabel("Time")
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(save_file)
+            plt.close()
+            
+        except Exception as e:
+            print(f"Error plotting KM for {name_for_plot}: {e}")
+
+    # --- Loop Genes ---
     for gene in available_feats:
-        # --- 1. Univariate Cox ---
+        # Univariate Continuous Cox (Stats for CSV)
         try:
             cph = CoxPHFitter()
-            # Chỉ lấy cột gene hiện tại + Time + Event
             df_gene = df_analysis[[gene, 'T', 'E']].dropna()
-            cph.fit(df_gene, duration_col='T', event_col='E')
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cph.fit(df_gene, duration_col='T', event_col='E')
             
             summary = cph.summary.loc[gene]
             hr = summary['exp(coef)']
@@ -424,47 +511,46 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
                 "CI_Lower": lower_ci,
                 "CI_Upper": upper_ci,
                 "P_value": p_val,
-                "Role": "Risk (Hại)" if hr > 1 else "Protective (Lợi)"
+                "Role": "Risk" if hr > 1 else "Protective"
             })
-        except Exception as e:
-            print(f"Lỗi tính Cox cho {gene}: {e}")
+        except Exception: pass
 
-        # --- 2. Kaplan-Meier Plot (High vs Low) ---
+        # Plot KM (Individual Gene)
+        plot_km_with_stats(
+            df_analysis[gene].values,
+            gene,
+            df_analysis['T'].values,
+            df_analysis['E'].values,
+            out_path / f"KM_{gene}.png"
+        )
+    
+    # --- Biosignature (Combined) ---
+    if len(available_feats) > 1:
+        print(f"   >> Computing Biosignature for {len(available_feats)} features...")
         try:
-            median_val = df_gene[gene].median()
-            high_mask = df_gene[gene] > median_val
+            cph_multi = CoxPHFitter(penalizer=0.1) # Add slight penalizer
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cph_multi.fit(df_analysis, duration_col='T', event_col='E')
             
-            kmf_high = KaplanMeierFitter()
-            kmf_low = KaplanMeierFitter()
+            # Predict Risk Score (partial hazard) within this dataset (Statistical Description)
+            risk_scores = cph_multi.predict_partial_hazard(df_analysis)
             
-            plt.figure(figsize=(6, 4))
-            ax = plt.subplot(111)
-            
-            kmf_high.fit(df_gene['T'][high_mask], event_observed=df_gene['E'][high_mask], label=f"High {gene}")
-            kmf_high.plot_survival_function(ax=ax, color='red')
-            
-            kmf_low.fit(df_gene['T'][~high_mask], event_observed=df_gene['E'][~high_mask], label=f"Low {gene}")
-            kmf_low.plot_survival_function(ax=ax, color='green')
-            
-            lr_result = logrank_test(
-                df_gene['T'][high_mask], df_gene['T'][~high_mask],
-                df_gene['E'][high_mask], df_gene['E'][~high_mask]
+            plot_km_with_stats(
+                risk_scores.values,
+                "Biosignature_Selected",
+                df_analysis['T'].values,
+                df_analysis['E'].values,
+                out_path / "KM_Biosignature.png",
+                add_to_results=True
             )
-            
-            plt.title(f"{gene}: High vs Low (p={lr_result.p_value:.4f})")
-            plt.ylabel("Survival Probability")
-            plt.xlabel("Time")
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(out_path / f"KM_{gene}.png")
-            plt.close()
-            
         except Exception as e:
-            print(f"Lỗi vẽ KM cho {gene}: {e}")
+            print(f"   >> [WARN] Could not plot Biosignature: {e}")
 
     # --- 3. Lưu bảng tổng hợp ---
     if results:
         res_df = pd.DataFrame(results)
+        # Sort so Biosignature (if any) is easy to find, often P-value based
         res_df = res_df.sort_values("P_value")
         save_path = Path(outdir) / csv_name
         res_df.to_csv(save_path, index=False)
