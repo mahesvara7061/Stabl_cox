@@ -505,25 +505,28 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
                 try:
                     # Create DataFrame with sample_id and prognosis
                     # high_mask: True = High Risk (Bad Prognosis), False = Low Risk (Good Prognosis)
-                    prognosis_labels = ["Bad" if is_high else "Good" for is_high in high_mask]
+                    prognosis_labels = ["Bad Prognosis" if is_high else "Good Prognosis" for is_high in high_mask]
                     
-                    # Assuming data_values index corresponds to sample_ids if available,
-                    # but here we passed numpy arrays. 
-                    # We need to rely on the index of df_analysis which should be aligned with X/y.
-                    # Note: plot_km_with_stats is called within analyze_individual_genes where df_analysis is defined.
-                    
-                    df_export = pd.DataFrame({
+                    # Core info
+                    df_core = pd.DataFrame({
                         "sample_id": df_analysis.index,
-                        "time": time_col,
-                        "event": event_col,
-                        "risk_score": data_values,
                         "prognosis_group": prognosis_labels,
-                        "threshold_used": threshold_val
+                        # "time": time_col,
+                        # "event": event_col,
+                        # "risk_score": data_values,
+                        # "threshold_used": threshold_val
                     })
+                    
+                    # Add gene expressions (drop T and E from df_analysis as we have them or don't need duplicates)
+                    df_genes = df_analysis[available_feats] # available_feats is defined in parent scope
+                    
+                    # Combine: sample_id, prognosis, gene1, gene2...
+                    # Align by index just in case, though they should be aligned
+                    df_export = pd.concat([df_core.set_index("sample_id"), df_genes], axis=1).reset_index()
                     
                     csv_name = f"prognosis_{name_for_plot}.csv"
                     df_export.to_csv(out_path / csv_name, index=False)
-                    print(f"      >> [INFO] Saved prognosis labels to: {csv_name}")
+                    print(f"      >> [INFO] Saved prognosis labels + expression to: {csv_name}")
                 except Exception as e:
                     print(f"      >> [WARN] Could not save prognosis CSV: {e}")
             
