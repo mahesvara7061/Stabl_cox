@@ -505,12 +505,12 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
                 try:
                     # Create DataFrame with sample_id and prognosis
                     # high_mask: True = High Risk (Bad Prognosis), False = Low Risk (Good Prognosis)
-                    prognosis_labels = ["Bad Prognosis" if is_high else "Good Prognosis" for is_high in high_mask]
+                    prognosis_labels = ["Bad" if is_high else "Good" for is_high in high_mask]
                     
                     # Core info
                     df_core = pd.DataFrame({
                         "sample_id": df_analysis.index,
-                        "prognosis_group": prognosis_labels,
+                        "Label": prognosis_labels,
                         # "time": time_col,
                         # "event": event_col,
                         # "risk_score": data_values,
