@@ -406,6 +406,7 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
 
     # --- Helper: Plot KM with detailed stats ---
     def plot_km_with_stats(data_values, name_for_plot, time_col, event_col, save_file, add_to_results=False, fixed_threshold=None):
+        print(f"   >> [PLOT] Generating VS KM for: {name_for_plot}")
         try:
             # 1. Split
             if fixed_threshold is not None:
@@ -422,7 +423,7 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
             n_low = (~high_mask).sum()
             
             if n_high == 0 or n_low == 0:
-                print(f"   >> [SKIP] Cannot split {name_for_plot} (High={n_high}, Low={n_low})")
+                print(f"      >> [SKIP] Cannot split {name_for_plot} (High={n_high}, Low={n_low})")
                 return
 
             # 2. Log-rank test
@@ -480,7 +481,8 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
                 f"Log-rank p: {p_logrank:.2e}\n"
                 f"HR(High): {hr_high:.2f}\n"
                 f"p(HR): {p_hr:.2e}\n"
-                f"n(High)={n_high}, n(Low)={n_low}"
+                f"n(High)={n_high}, n(Low)={n_low}\n"
+                f"Threshold: {threshold_val:.4f}"
             )
             
             ax.add_artist(plt.legend(loc='best')) 
@@ -496,6 +498,34 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
             plt.tight_layout()
             plt.savefig(save_file)
             plt.close()
+
+            # --- NEW: Save Prognosis Labels to CSV ---
+            # Only if this is a Biosignature plot (Refit or Transfer)
+            if "Biosignature" in name_for_plot:
+                try:
+                    # Create DataFrame with sample_id and prognosis
+                    # high_mask: True = High Risk (Bad Prognosis), False = Low Risk (Good Prognosis)
+                    prognosis_labels = ["Bad" if is_high else "Good" for is_high in high_mask]
+                    
+                    # Assuming data_values index corresponds to sample_ids if available,
+                    # but here we passed numpy arrays. 
+                    # We need to rely on the index of df_analysis which should be aligned with X/y.
+                    # Note: plot_km_with_stats is called within analyze_individual_genes where df_analysis is defined.
+                    
+                    df_export = pd.DataFrame({
+                        "sample_id": df_analysis.index,
+                        "time": time_col,
+                        "event": event_col,
+                        "risk_score": data_values,
+                        "prognosis_group": prognosis_labels,
+                        "threshold_used": threshold_val
+                    })
+                    
+                    csv_name = f"prognosis_{name_for_plot}.csv"
+                    df_export.to_csv(out_path / csv_name, index=False)
+                    print(f"      >> [INFO] Saved prognosis labels to: {csv_name}")
+                except Exception as e:
+                    print(f"      >> [WARN] Could not save prognosis CSV: {e}")
             
         except Exception as e:
             print(f"Error plotting KM for {name_for_plot}: {e}")
@@ -567,6 +597,7 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
         # Strategies 1 & 2: Transfer Learning (if external model provided)
         if trained_model is not None:
             try:
+                print(f"   >> [INFO] Computing Biosignature Transfer Strategies...") 
                 # Predict Risk Score using External Model
                 # Need to match feature columns passed to model
                 risk_scores_ext = trained_model.predict_partial_hazard(df_analysis)
@@ -574,6 +605,7 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
                 # Strategy 1: Fixed Threshold (from Selection)
                 # "Validation of Cutoff"
                 if trained_median is not None:
+                     print(f"      >> Strategy 1: Transfer Fixed Threshold (Thr={trained_median:.4f})")
                      plot_km_with_stats(
                         risk_scores_ext.values,
                         "Biosignature_Transfer_FixedThr",
@@ -586,6 +618,7 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
 
                 # Strategy 2: Adaptive Threshold (Median of Verify)
                 # "Validation of Score"
+                print(f"      >> Strategy 2: Transfer Adaptive Median Threshold")
                 plot_km_with_stats(
                     risk_scores_ext.values,
                     "Biosignature_Transfer_MedianThr",
