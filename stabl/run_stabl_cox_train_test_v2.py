@@ -369,15 +369,16 @@ def evaluate_survival_model_comprehensive(model, X_train, y_train, X_test, y_tes
     return results
 
 
-def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
+def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", trained_model=None, trained_median=None):
     """
     Phân tích chi tiết từng gene được chọn + Biosignature (Risk Score form Multivariate Cox):
     1. Univariate Cox Regression (HR, CI, p-value)
     2. Kaplan-Meier Plot (High vs Low expression) with detailed stats.
+    3. Biosignature Evaluation (Refit, Transfer Fixed Threshold, Transfer Adaptive Threshold).
     """
     if 'CoxPHFitter' not in globals():
         print("[WARNING] Không có thư viện lifelines. Bỏ qua phân tích từng gene.")
-        return
+        return None, None
 
     label_str = f" ({dataset_label})" if dataset_label else ""
     print(f"\n[INFO] Đang phân tích đơn biến{label_str} cho {len(selected_features)} gene được chọn...")
@@ -404,12 +405,18 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
     df_analysis['E'] = y['event'].astype(int).values
 
     # --- Helper: Plot KM with detailed stats ---
-    def plot_km_with_stats(data_values, name_for_plot, time_col, event_col, save_file, add_to_results=False):
+    def plot_km_with_stats(data_values, name_for_plot, time_col, event_col, save_file, add_to_results=False, fixed_threshold=None):
         try:
-            # 1. Median Split
-            median_val = np.median(data_values)
-            # High means > median
-            high_mask = data_values > median_val
+            # 1. Split
+            if fixed_threshold is not None:
+                threshold_val = fixed_threshold
+                suffix = " (Fixed Thr)"
+            else:
+                threshold_val = np.median(data_values)
+                suffix = " (Median Thr)"
+
+            # High means > threshold
+            high_mask = data_values > threshold_val
             
             n_high = high_mask.sum()
             n_low = (~high_mask).sum()
@@ -422,7 +429,11 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
             T_high, E_high = time_col[high_mask], event_col[high_mask]
             T_low, E_low = time_col[~high_mask], event_col[~high_mask]
             
-            lr_res = logrank_test(T_high, T_low, E_high, E_low)
+            # Explicitly use keyword arguments for safety
+            lr_res = logrank_test(
+                durations_A=T_high, durations_B=T_low, 
+                event_observed_A=E_high, event_observed_B=E_low
+            )
             p_logrank = lr_res.p_value
 
             # 3. Binary Cox for HR (High vs Low)
@@ -446,7 +457,7 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
                     "CI_Lower": lower_ci,
                     "CI_Upper": upper_ci,
                     "P_value": p_hr,
-                    "Role": "Biosignature"
+                    "Role": "Biosignature" if "Biosignature" in name_for_plot else "Gene"
                 })
 
             # 4. Plot
@@ -478,7 +489,7 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
             ax.text(0.02, 0.05, stats_str, transform=ax.transAxes, fontsize=10,
                     verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
 
-            plt.title(f"{name_for_plot}")
+            plt.title(f"{name_for_plot}{suffix}")
             plt.ylabel("Survival Probability")
             plt.xlabel("Time")
             plt.grid(True, alpha=0.3)
@@ -525,27 +536,66 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
         )
     
     # --- Biosignature (Combined) ---
+    local_cph = None
+    local_risk_median = None
+
     if len(available_feats) > 1:
         print(f"   >> Computing Biosignature for {len(available_feats)} features...")
+        
+        # Strategy 3: Refit on current dataset (Local Model, Median Threshold)
+        # This is strictly local evaluation (Re-discovery)
         try:
-            cph_multi = CoxPHFitter(penalizer=0.1) # Add slight penalizer
+            local_cph = CoxPHFitter(penalizer=0.1) # Add slight penalizer
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                cph_multi.fit(df_analysis, duration_col='T', event_col='E')
+                local_cph.fit(df_analysis, duration_col='T', event_col='E')
             
-            # Predict Risk Score (partial hazard) within this dataset (Statistical Description)
-            risk_scores = cph_multi.predict_partial_hazard(df_analysis)
+            risk_scores_refit = local_cph.predict_partial_hazard(df_analysis)
+            local_risk_median = np.median(risk_scores_refit)
             
             plot_km_with_stats(
-                risk_scores.values,
-                "Biosignature_Selected",
+                risk_scores_refit.values,
+                "Biosignature_Refit",
                 df_analysis['T'].values,
                 df_analysis['E'].values,
-                out_path / "KM_Biosignature.png",
+                out_path / "KM_Biosignature_Refit.png",
                 add_to_results=True
             )
         except Exception as e:
-            print(f"   >> [WARN] Could not plot Biosignature: {e}")
+            print(f"   >> [WARN] Could not plot Biosignature (Refit): {e}")
+
+        # Strategies 1 & 2: Transfer Learning (if external model provided)
+        if trained_model is not None:
+            try:
+                # Predict Risk Score using External Model
+                # Need to match feature columns passed to model
+                risk_scores_ext = trained_model.predict_partial_hazard(df_analysis)
+                
+                # Strategy 1: Fixed Threshold (from Selection)
+                # "Validation of Cutoff"
+                if trained_median is not None:
+                     plot_km_with_stats(
+                        risk_scores_ext.values,
+                        "Biosignature_Transfer_FixedThr",
+                        df_analysis['T'].values,
+                        df_analysis['E'].values,
+                        out_path / "KM_Biosignature_Transfer_FixedThr.png",
+                        add_to_results=True,
+                        fixed_threshold=trained_median
+                    )
+
+                # Strategy 2: Adaptive Threshold (Median of Verify)
+                # "Validation of Score"
+                plot_km_with_stats(
+                    risk_scores_ext.values,
+                    "Biosignature_Transfer_MedianThr",
+                    df_analysis['T'].values,
+                    df_analysis['E'].values,
+                    out_path / "KM_Biosignature_Transfer_MedianThr.png",
+                    add_to_results=True
+                )
+            except Exception as e:
+                print(f"   >> [WARN] Could not plot Biosignature (Transfer): {e}")
 
     # --- 3. Lưu bảng tổng hợp ---
     if results:
@@ -556,6 +606,8 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label=""):
         res_df.to_csv(save_path, index=False)
         print(f"[DONE] Đã lưu phân tích đơn biến{label_str} tại: {save_path}")
         print(res_df.to_string())
+    
+    return local_cph, local_risk_median
 
 # -------------------------------
 # Main Pipeline
@@ -667,7 +719,7 @@ def run_pipeline(args):
 
     # --- NEW: Analyze on Selection Dataset ---
     print("\n[ANALYSIS] Analyzing Individual Genes on Selection Dataset...")
-    analyze_individual_genes(X_sel, y_sel, selected_features, args.outdir, dataset_label="selection_dataset")
+    sel_model, sel_median = analyze_individual_genes(X_sel, y_sel, selected_features, args.outdir, dataset_label="selection_dataset")
 
     # ---------------------------------------------------------
     # 3. Load Verify Data
@@ -690,7 +742,12 @@ def run_pipeline(args):
     X_verify_analyze = X_verify_analyze[selected_features].replace([np.inf, -np.inf], np.nan)
     X_verify_analyze = X_verify_analyze.fillna(X_verify_analyze.median())
     
-    analyze_individual_genes(X_verify_analyze, y_verify, selected_features, args.outdir, dataset_label="verify_entire_dataset")
+    analyze_individual_genes(
+        X_verify_analyze, y_verify, selected_features, args.outdir, 
+        dataset_label="verify_entire_dataset",
+        trained_model=sel_model,
+        trained_median=sel_median
+    )
 
     # 3b. Split for Final Models
     print(f"\n[STEP 3b] Splitting Verify Data (Test Ratio={args.verify_split_ratio})...")
