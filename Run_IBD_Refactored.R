@@ -408,21 +408,21 @@ run_ml_batch <- function(
 # USAGE EXAMPLE
 # ============================================================================
 # Prepare your data
-my_data <- read.csv("/mnt/d/Labs/Pharmaco-Omics/stabl/results_survival_46/individual_genes_analysis_verify_entire_dataset/prognosis_Biosignature_Transfer_MedianThr.csv", row.names = 1, check.names = FALSE)
+my_data <- read.csv("/mnt/d/Labs/Pharmaco-Omics/stabl/data/HCC/tcga_vst_only_HCC_recurrence/ML_Input_TCGA_LIHC_Recurrence_10_genes.csv", row.names = 1, check.names = FALSE)
 
 # Run batch analysis with clinical covariates included
 run_ml_batch(
   df= my_data,
   models            = c("LOGIT", "RF", "PLSDA", "SVM"),
-  classname         = c("Good", "Bad"),
+  classname         = c("Recurrence", "Non_Recurrence"),
   drop_cols         = NULL,
   non_continuous_cols = NULL,      # numeric but non-continuous columns
-  n_runs            = 200,
+  n_runs            = 50,
   seed_mode         = c("increment","file"),
   base_seed         = 20251202,
   seeds_file        = NULL,
   start_index       = 1,
-  out_dir           = "results_prognosis_Biosignature_ICGC",
+  out_dir           = "/mnt/d/labs/pharmaco-omics/stabl/results_HCC_Recurrence_10_genes",
   split_ratio       = 0.7,
   kouter            = 5,
   kinner            = 5,

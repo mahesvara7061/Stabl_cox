@@ -180,7 +180,7 @@ rf_perform_std_Revised <- function(
   # Comparision <- data_input_ML$Label %>% unique() %>% paste(collapse = " vs ")  # Description of classification task
 
   # If you want to customize Comparision, uncomment and modify the line below
-  Comparision <- "Good Prognosis vs Poor Prognosis"
+  Comparision <- "Recurrence vs Non-Recurrence"
   
   # Mean ROC curve data
   avg_AUC <- data.frame(
@@ -494,7 +494,7 @@ rf_perform_std_Revised <- function(
   
 #   # Visualization Data
 #   # Comparision <- data_input_ML$Label %>% unique() %>% paste(collapse = " vs ")
-#   Comparision <- "Good Prognosis vs Poor Prognosis"
+#   Comparision <- "Recurrence vs Non-Recurrence"
 #   avg_AUC <- data.frame(roc_mean_spe = rev(roc_mean_spe), roc_mean_sen = rev(roc_mean_sen))
 #   polygon_SD_AUC <- data.frame(x = c(roc_sd_spe_lower, rev(roc_sd_spe_upper)),
 #                                y = c(roc_sd_sen_lower, rev(roc_sd_sen_uppper)))
@@ -777,7 +777,7 @@ rf_perform_std_Revised <- function(
 #   roc_sd_sen_lower <- roc_mean_sen - roc_sd_sen
   
 #   # 11. Visualization Data
-#   Comparision <- "Good Prognosis vs Poor Prognosis"
+#   Comparision <- "Recurrence vs Non-Recurrence"
 #   avg_AUC <- data.frame(roc_mean_spe = rev(roc_mean_spe), roc_mean_sen = rev(roc_mean_sen))
 #   polygon_SD_AUC <- data.frame(x = c(roc_sd_spe_lower, rev(roc_sd_spe_upper)),
 #                                y = c(roc_sd_sen_lower, rev(roc_sd_sen_uppper)))
@@ -1085,7 +1085,7 @@ svm_perform_std_Revised <- function(
   roc_sd_sen_lower <- roc_mean_sen - roc_sd_sen
   
   # Comparision <- data_input_ML$Label %>% unique() %>% paste(collapse = " vs ")
-  Comparision <- "Good Prognosis vs Poor Prognosis"
+  Comparision <- "Recurrence vs Non-Recurrence"
   avg_AUC <- data.frame(roc_mean_spe = rev(roc_mean_spe), roc_mean_sen = rev(roc_mean_sen))
   polygon_SD_AUC <- data.frame(x = c(roc_sd_spe_lower, rev(roc_sd_spe_upper)),
                                y = c(roc_sd_sen_lower, rev(roc_sd_sen_uppper)))
@@ -1352,7 +1352,7 @@ svm_perform_std_Revised <- function(
 #   # Visualization Data
 #   # Comparision <- data_input_ML$Label %>% unique() %>% paste(collapse = " vs ")
 #   # If you want to customize Comparision, uncomment and modify the line below
-#   Comparision <- "Good Prognosis vs Poor Prognosis"
+#   Comparision <- "Recurrence vs Non-Recurrence"
 #   avg_AUC <- data.frame(roc_mean_spe = rev(roc_mean_spe), roc_mean_sen = rev(roc_mean_sen))
 #   polygon_SD_AUC <- data.frame(x = c(roc_sd_spe_lower, rev(roc_sd_spe_upper)),
 #                                y = c(roc_sd_sen_lower, rev(roc_sd_sen_uppper)))
@@ -1638,7 +1638,7 @@ logit_perform_std_Revised <- function(
   
   # 12. Visualization Data
   # Comparision <- data_input_ML$Label %>% unique() %>% paste(collapse = " vs ")
-  Comparision <- "Good Prognosis vs Poor Prognosis"
+  Comparision <- "Recurrence vs Non-Recurrence"
   avg_AUC <- data.frame(roc_mean_spe = rev(roc_mean_spe), roc_mean_sen = rev(roc_mean_sen))
   polygon_SD_AUC <- data.frame(x = c(roc_sd_spe_lower, rev(roc_sd_spe_upper)),
                                y = c(roc_sd_sen_lower, rev(roc_sd_sen_uppper)))
@@ -1881,7 +1881,7 @@ logit_perform_std_Revised <- function(
 #   # Visualization Data
 #   # Comparision <- data_input_ML$Label %>% unique() %>% paste(collapse = " vs ")
 #   # If you want to customize Comparision, uncomment and modify the line below
-#   Comparision <- "Good Prognosis vs Poor Prognosis"
+#   Comparision <- "Recurrence vs Non-Recurrence"
 #   avg_AUC <- data.frame(roc_mean_spe = rev(roc_mean_spe), roc_mean_sen = rev(roc_mean_sen))
 #   polygon_SD_AUC <- data.frame(x = c(roc_sd_spe_lower, rev(roc_sd_spe_upper)),
 #                                y = c(roc_sd_sen_lower, rev(roc_sd_sen_uppper)))
@@ -2159,7 +2159,7 @@ plsda_perform_std_Revised <- function(
   roc_sd_sen_lower <- roc_mean_sen - roc_sd_sen
   
   # Comparision <- data_input_ML$Label %>% unique() %>% paste(collapse = " vs ")
-  Comparision <- "Good Prognosis vs Poor Prognosis"
+  Comparision <- "Recurrence vs Non-Recurrence"
   avg_AUC <- data.frame(roc_mean_spe = rev(roc_mean_spe), roc_mean_sen = rev(roc_mean_sen))
   polygon_SD_AUC <- data.frame(x = c(roc_sd_spe_lower, rev(roc_sd_spe_upper)),
                                y = c(roc_sd_sen_lower, rev(roc_sd_sen_uppper)))
