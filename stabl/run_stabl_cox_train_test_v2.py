@@ -107,10 +107,11 @@ def load_counts(counts_path, num_genes: int | None = None, debug_dir: str | None
     return X
 
 
-def load_clinical(clinical_path):
+def load_clinical(clinical_path, target_type="OS"):
     """
-    Read clinical with columns: sample id, OS, censored.
-    Convention: censored = 0 (alive), 1 (dead) -> event=False/True.
+    Read clinical with columns: sample id, Time, Event.
+    target_type: "OS" (Overall Survival) or "RFS" (Recurrence/Relapse Free Survival)
+    Convention: censored = 0 (no event), 1 (event) -> event=False/True.
     """
     sep = detect_sep(clinical_path)
     clin = pd.read_csv(clinical_path, sep=sep, header=0)
@@ -120,21 +121,46 @@ def load_clinical(clinical_path):
     clin = clin.rename(columns=ren)
 
     col_map = {}
+    # 1. Sample ID candidates
     for cand in ["sample id", "sample_id", "sample", "id", "case_id", "patient_id", "case submitter id", "cgga_id"]:
         if cand in clin.columns:
             col_map["sample_id"] = cand
             break
-    for cand in ["os", "time", "overall_survival", "overall survival", "survival_time", "survival time", "days_to_death", "days to death"]:
+            
+    # Be flexible but prioritize based on target_type
+    if target_type.upper() == "RFS":
+        time_cands = ["rfs_time", "dfs_time", "rfs_days", "rfs_months", "dfs_days", "df_time", "recurrence_time", "time_to_recurrence", "rfs", "dfs"]
+        event_cands = ["rfs_status", "dfs_status", "recurrence_status", "recurrence_event", "recurrence", "relapse", "relapse_status"]
+    else: # OS
+        time_cands = ["os_time", "os_days", "os_months", "overall_survival", "overall survival", "survival_time", "survival time", "days_to_death", "days to death", "time", "os"]
+        event_cands = ["os_status", "vital_status", "vital status", "censored", "censor", "status", "event", "survival_status", "os"]
+
+    # 2. Search Time
+    for cand in time_cands:
         if cand in clin.columns:
             col_map["time"] = cand
             break
-    for cand in ["censored", "censor", "status", "event", "vital_status", "vital status"]:
+    # Fallback generic time if specific not found
+    if "time" not in col_map:
+        for cand in ["time", "survival_time", "days_to_death"]:
+            if cand in clin.columns:
+                col_map["time"] = cand
+                break
+
+    # 3. Search Event
+    for cand in event_cands:
         if cand in clin.columns:
             col_map["censored"] = cand
             break
+    # Fallback generic event
+    if "censored" not in col_map:
+        for cand in ["censored", "censor", "status", "event", "vital_status"]:
+            if cand in clin.columns:
+                col_map["censored"] = cand
+                break
 
     if set(col_map.keys()) != {"sample_id", "time", "censored"}:
-        raise ValueError(f"Cannot find all required columns. Mapped: {col_map}")
+        raise ValueError(f"Cannot find all required columns for {target_type}. Mapped: {col_map}. Available: {list(clin.columns)}")
 
     sid_raw = clin[col_map["sample_id"]].astype(str)
     time_raw = clin[col_map["time"]]
@@ -148,8 +174,8 @@ def load_clinical(clinical_path):
 
     cens_str = cens_raw.astype(str).str.strip().str.lower()
     text_map = {
-        "alive": "0", "censored": "0", "living": "0", "no_event": "0", "no event": "0",
-        "dead": "1", "deceased": "1", "event": "1", "died": "1",
+        "alive": "0", "censored": "0", "living": "0", "no_event": "0", "no event": "0", "disease free": "0", "recurrence free": "0",
+        "dead": "1", "deceased": "1", "event": "1", "died": "1", "recurred": "1", "recurrence": "1", "relapse": "1",
         "0.0": "0", "1.0": "1"
     }
     cens_norm = cens_str.map(lambda x: text_map.get(x, x))
@@ -163,7 +189,7 @@ def load_clinical(clinical_path):
         y = y[~y.index.duplicated(keep="first")]
 
     y = y.dropna(subset=["time", "event"])
-    print(f"[INFO] Loaded clinical data with {y.shape[0]} samples.")
+    print(f"[INFO] Loaded clinical data ({target_type}) with {y.shape[0]} samples. (Time col: {col_map['time']}, Event col: {col_map['censored']})")
     return y
 
 
@@ -484,6 +510,10 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
                 f"n(High)={n_high}, n(Low)={n_low}\n"
                 f"Threshold: {threshold_val:.4f}"
             )
+
+            # Add Gene Count for Biosignature
+            if "Biosignature" in name_for_plot:
+                stats_str += f"\nN_Genes: {len(available_feats)}"
             
             ax.add_artist(plt.legend(loc='best')) 
             
@@ -693,11 +723,11 @@ def run_pipeline(args):
     # ---------------------------------------------------------
     print("\n[STEP 1] Loading Selection Data...")
     X_sel = load_counts(args.selection_counts, num_genes=args.num_genes, debug_dir=args.debug_dir)
-    y_sel = load_clinical(args.selection_clinical)
+    y_sel = load_clinical(args.selection_clinical, target_type=args.target_type)
     X_sel, y_sel = align_X_y(X_sel, y_sel)
     
     # Preprocessing
-    print(f"[INFO] Preprocessing Selection Data (LowInfoFilter, Impute, Scale)...")
+    print(f"[INFO] Preprocessing Selection Data (LIF, Impute, Scale)...")
     lif = LowInfoFilter(max_nan_fraction=0.2)
     lif.fit(X_sel)
     X_sel_np = lif.transform(X_sel)
@@ -708,6 +738,9 @@ def run_pipeline(args):
     X_sel = pd.DataFrame(imputer.fit_transform(X_sel), index=X_sel.index, columns=X_sel.columns)
     scaler = StandardScaler()
     X_sel = pd.DataFrame(scaler.fit_transform(X_sel), index=X_sel.index, columns=X_sel.columns)
+    
+    # Save scaler features for later use on Verify data
+    scaler_feature_names = X_sel.columns.tolist()
 
     # Drop leakage
     leakage_keywords = ["os", "time", "overall_survival", "censored", "event", "status"]
@@ -761,28 +794,107 @@ def run_pipeline(args):
     # 3. Load Verify Data
     # ---------------------------------------------------------
     print("\n[STEP 3] Loading Verify Data...")
-    X_verify = load_counts(args.verify_counts, num_genes=args.num_genes, debug_dir=args.debug_dir) 
-    y_verify = load_clinical(args.verify_clinical)
+    # NOTE: num_genes is ONLY for selection dataset cutting. Verify dataset should be loaded fully
+    # to find matching genes later.
+    X_verify = load_counts(args.verify_counts, num_genes=None, debug_dir=args.debug_dir) 
+    y_verify = load_clinical(args.verify_clinical, target_type=args.target_type)
     X_verify, y_verify = align_X_y(X_verify, y_verify)
 
-    # 3a. Analyze on Entire Verify Dataset
-    print("\n[ANALYSIS] Analyzing Individual Genes on Entire Verify Dataset...")
-    X_verify_analyze = X_verify.copy()
+    # --- FILTER SELECTED FEATURES FOUND IN VERIFY ---
+    verified_genes = [f for f in selected_features if f in X_verify.columns]
+    print(f"\n[INFO] {len(verified_genes)}/{len(selected_features)} selected features found in Verify dataset.")
+    pd.Series(verified_genes, name="Verified_Features").to_csv(Path(args.outdir) / "verified_features.csv", index=False)
     
-    # Fill missing columns if any feature from selection is missing in verify
-    missing_feats = [f for f in selected_features if f not in X_verify_analyze.columns]
-    if missing_feats:
-        print(f"[WARN] {len(missing_feats)} features missing in Verify dataset. Filling with 0.")
-        for f in missing_feats: X_verify_analyze[f] = 0.0
+    if len(selected_features) > len(verified_genes):
+        missing = list(set(selected_features) - set(verified_genes))
+        print(f"       Missing features (skipped): {missing}")
+    
+    if len(verified_genes) == 0:
+        print("[ERROR] No selected features found in Verify dataset. Exiting verification steps.")
+        return
+
+    # 3a. Analyze on Entire Verify Dataset
+    print("\n[ANALYSIS] Analyzing Individual Genes on Entire Verify Dataset (Verified Genes only)...")
+    
+    # Base Imputed Data
+    X_verify_base = X_verify.copy()
+    X_verify_base = X_verify_base[verified_genes].replace([np.inf, -np.inf], np.nan)
+    X_verify_base = X_verify_base.fillna(X_verify_base.median())
+
+    # --- PREPARE TRANSFER MODEL (TRAIN ON SELECTION WITH VERIFIED GENES ONLY) ---
+    transfer_model = None
+    transfer_median = None
+    
+    if len(verified_genes) > 0 and 'CoxPHFitter' in globals():
+        try:
+            print("\n[INFO] Retraining Transfer Model on Selection Data using ONLY Verified Genes...")
+            X_sel_sub = X_sel[verified_genes].copy()
+            df_sel_train = X_sel_sub.copy()
+            df_sel_train['T'] = y_sel['time'].values
+            df_sel_train['E'] = y_sel['event'].astype(int).values
+            
+            transfer_model = CoxPHFitter(penalizer=0.1)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                transfer_model.fit(df_sel_train, duration_col='T', event_col='E')
+            
+            risk_scores_sel = transfer_model.predict_partial_hazard(df_sel_train)
+            transfer_median = np.median(risk_scores_sel)
+            print(f"       >> Transfer Model retrained successfully on {len(verified_genes)} genes. Median Risk (Sel) = {transfer_median:.4f}")
+        except Exception as e:
+            print(f"       >> [WARN] Could not retrain transfer model: {e}")
+            transfer_model = None
+            transfer_median = None
+
+    # --- VARIANT 1: Selection Scaling (No Refit) ---
+    print("\n[INFO] [Variant 1] Scaling Verify Data using Selection Data statistics (No Refit)...")
+    X_verify_sel = X_verify_base.copy()
+    
+    if 'scaler_feature_names' in locals():
+        scaler_feats_set = set(scaler_feature_names) 
+        valid_cols = [col for col in X_verify_sel.columns if col in scaler_feats_set]
+        missing_cols = list(set(X_verify_sel.columns) - set(valid_cols))
         
-    X_verify_analyze = X_verify_analyze[selected_features].replace([np.inf, -np.inf], np.nan)
-    X_verify_analyze = X_verify_analyze.fillna(X_verify_analyze.median())
+        if missing_cols:
+            print(f"[WARN] {len(missing_cols)} features not found in Selection Scaler: {missing_cols}")
+            X_verify_sel = X_verify_sel[valid_cols]
+
+        if not X_verify_sel.empty:
+            feat_map = {name: i for i, name in enumerate(scaler_feature_names)}
+            indices = [feat_map[col] for col in X_verify_sel.columns]
+            mean_vals = scaler.mean_[indices]
+            scale_vals = scaler.scale_[indices]
+            X_verify_sel = (X_verify_sel - mean_vals) / scale_vals
     
     analyze_individual_genes(
-        X_verify_analyze, y_verify, selected_features, args.outdir, 
-        dataset_label="verify_entire_dataset",
-        trained_model=sel_model,
-        trained_median=sel_median
+        X_verify_sel, y_verify, verified_genes, args.outdir, 
+        dataset_label="verify_selection_scaling",
+        trained_model=transfer_model, 
+        trained_median=transfer_median 
+    )
+
+    # --- VARIANT 2: Independent Scaling (Refit on Verify) ---
+    print("\n[INFO] [Variant 2] Independent Scaling (Fit on Verify)...")
+    scaler_ver = StandardScaler()
+    X_verify_ind = pd.DataFrame(
+        scaler_ver.fit_transform(X_verify_base), 
+        index=X_verify_base.index, 
+        columns=X_verify_base.columns
+    )
+    analyze_individual_genes(
+        X_verify_ind, y_verify, verified_genes, args.outdir, 
+        dataset_label="verify_independent_scaling",
+        trained_model=transfer_model,
+        trained_median=transfer_median 
+    )
+
+    # --- VARIANT 3: No Scaling ---
+    print("\n[INFO] [Variant 3] No Scaling (Imputed only)...")
+    analyze_individual_genes(
+        X_verify_base, y_verify, verified_genes, args.outdir, 
+        dataset_label="verify_no_scaling",
+        trained_model=transfer_model, 
+        trained_median=transfer_median 
     )
 
     # 3b. Split for Final Models
@@ -799,21 +911,28 @@ def run_pipeline(args):
     # Helper to preprocess
     def preprocess_data(X_tr, X_te, features=None):
         if features is not None:
-            # Fill missing features with 0
-            missing = set(features) - set(X_tr.columns)
-            for f in missing: X_tr[f] = 0.0
-            missing = set(features) - set(X_te.columns)
-            for f in missing: X_te[f] = 0.0
-            X_tr = X_tr[features]
-            X_te = X_te[features]
+            # Case 1: Specific features requested (Verification of Selected Genes)
+            # STRICTLY keep these genes found in Verify. NO LowInfoFilter.
+            print("[INFO] Preprocessing with Verified Genes: Skipping LowInfoFilter to preserve selected set.")
+            valid_feats = [f for f in features if f in X_tr.columns]
+            if len(valid_feats) < len(features):
+                print(f"[WARN] Preprocessing: requested {len(features)} features, found {len(valid_feats)}.")
             
-        lif = LowInfoFilter(max_nan_fraction=0.2)
-        X_tr_np = lif.fit_transform(X_tr)
-        cols = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_tr.columns[lif.get_support()]
-        X_te_np = lif.transform(X_te)
-        
-        X_tr = pd.DataFrame(X_tr_np, index=X_tr.index, columns=cols)
-        X_te = pd.DataFrame(X_te_np, index=X_te.index, columns=cols)
+            X_tr = X_tr[valid_feats]
+            X_te = X_te[valid_feats]
+            # NO LIF applied here
+            
+        else:
+            # Case 2: Full Features (Baseline)
+            # Apply LowInfoFilter to remove constant/high-nan features
+            print("[INFO] Preprocessing Full Features: Applying LowInfoFilter.")
+            lif = LowInfoFilter(max_nan_fraction=0.2)
+            X_tr_np = lif.fit_transform(X_tr)
+            cols = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_tr.columns[lif.get_support()]
+            X_te_np = lif.transform(X_te)
+            
+            X_tr = pd.DataFrame(X_tr_np, index=X_tr.index, columns=cols)
+            X_te = pd.DataFrame(X_te_np, index=X_te.index, columns=cols)
         
         imputer = SimpleImputer(strategy="median")
         X_tr = pd.DataFrame(imputer.fit_transform(X_tr), index=X_tr.index, columns=X_tr.columns)
@@ -825,7 +944,7 @@ def run_pipeline(args):
         return X_tr, X_te
 
     # 1. Selected Features Data
-    X_train_sub, X_test_sub = preprocess_data(X_train.copy(), X_test.copy(), features=selected_features)
+    X_train_sub, X_test_sub = preprocess_data(X_train.copy(), X_test.copy(), features=verified_genes)
     # 2. Full Features Data
     print("[INFO] Processing Full Features Data (this might take a while)...")
     X_train_full, X_test_full = preprocess_data(X_train.copy(), X_test.copy())
@@ -979,6 +1098,7 @@ if __name__ == "__main__":
     parser.add_argument("--univariate_cox", action="store_true", help="Run univariate Cox selection before Stabl")
     parser.add_argument("--univariate_p", type=float, default=0.05, help="P-value threshold for univariate Cox")
     parser.add_argument("--selected_features_file", type=str, default=None, help="Path to file containing selected features (skip selection step)")
+    parser.add_argument("--target_type", type=str, default="OS", choices=["OS", "RFS"], help="Survival target: OS or RFS [Default: OS]")
 
     args = parser.parse_args()
     main(args)
