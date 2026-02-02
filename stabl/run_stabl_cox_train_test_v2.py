@@ -756,6 +756,10 @@ def run_pipeline(args):
             else:
                 selected_features = sf_df.iloc[:, 0].tolist()
             print(f"[INFO] Loaded {len(selected_features)} features from file.")
+            
+            # Save copy to current output dir
+            pd.Series(selected_features, name="Selected_Features").to_csv(Path(args.outdir) / "selected_features.csv", index=False)
+            
         except Exception as e:
             print(f"[ERROR] Failed to load selected features from file: {e}")
             return
