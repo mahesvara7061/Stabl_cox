@@ -698,8 +698,8 @@ def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None, model_typ
         lambda_grid=lambda_grid,
         n_bootstraps=n_bootstraps,
         artificial_type="knockoff",
-        artificial_proportion=0.5,
-        sample_fraction=0.8,
+        artificial_proportion=1.0,
+        sample_fraction=0.5,
         replace=False,
         bootstrap_threshold="median",
         fdr_threshold_range=np.arange(0.05, 1.01, 0.05),
@@ -728,11 +728,25 @@ def run_pipeline(args):
     
     # Preprocessing
     print(f"[INFO] Preprocessing Selection Data (LIF, Impute, Scale)...")
-    lif = LowInfoFilter(max_nan_fraction=0.2)
-    lif.fit(X_sel)
-    X_sel_np = lif.transform(X_sel)
-    cols = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_sel.columns[lif.get_support()]
-    X_sel = pd.DataFrame(X_sel_np, index=X_sel.index, columns=cols)
+    
+    # Setup log dir for removed features
+    removed_dir = Path(args.outdir) / "removed_features_logs"
+    removed_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. LowInfoFilter - DISABLED
+    # lif = LowInfoFilter(max_nan_fraction=0.2)
+    # lif.fit(X_sel)
+    
+    # # Identify dropped by LIF
+    # cols_kept_lif = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_sel.columns[lif.get_support()]
+    # dropped_lif = list(set(X_sel.columns) - set(cols_kept_lif))
+    # if dropped_lif:
+    #     print(f"[INFO] LowInfoFilter dropped {len(dropped_lif)} features.")
+    #     pd.Series(dropped_lif, name="Dropped_LIF").to_csv(removed_dir / "dropped_LIF.csv", index=False)
+
+    # X_sel_np = lif.transform(X_sel)
+    # X_sel = pd.DataFrame(X_sel_np, index=X_sel.index, columns=cols_kept_lif)
+    pass
     
     imputer = SimpleImputer(strategy="median")
     X_sel = pd.DataFrame(imputer.fit_transform(X_sel), index=X_sel.index, columns=X_sel.columns)
@@ -741,11 +755,6 @@ def run_pipeline(args):
     
     # Save scaler features for later use on Verify data
     scaler_feature_names = X_sel.columns.tolist()
-
-    # Drop leakage
-    leakage_keywords = ["os", "time", "overall_survival", "censored", "event", "status"]
-    to_drop = [c for c in X_sel.columns if any(k in str(c).lower() for k in leakage_keywords)]
-    if to_drop: X_sel = X_sel.drop(columns=to_drop)
 
     if args.selected_features_file:
         print(f"\n[INFO] Skipping Selection. Loading features from {args.selected_features_file}...")
@@ -765,12 +774,22 @@ def run_pipeline(args):
             return
     else:
         if args.univariate_cox:
+            genes_pre_cox = set(X_sel.columns)
             X_sel = run_univariate_cox(X_sel, y_sel, p_thresh=args.univariate_p, debug_dir=args.debug_dir)
+            genes_post_cox = set(X_sel.columns)
+            dropped_cox = list(genes_pre_cox - genes_post_cox)
+            if dropped_cox:
+                print(f"[INFO] Univariate Cox dropped {len(dropped_cox)} features.")
+                removed_dir = Path(args.outdir) / "removed_features_logs"
+                removed_dir.mkdir(parents=True, exist_ok=True)
+                pd.Series(dropped_cox, name="Dropped_UnivariateCox").to_csv(removed_dir / "dropped_univariate_cox.csv", index=False)
 
         # ---------------------------------------------------------
         # 2. Run STABL Feature Selection
         # ---------------------------------------------------------
         print("\n[STEP 2] Running STABL Feature Selection...")
+        print(f"[INFO] Number of genes input to STABL: {X_sel.shape[1]} (Samples: {X_sel.shape[0]})")
+
         stabl_cox = build_stabl_cox(n_bootstraps=args.n_boot, random_state=args.seed, debug_dir=args.debug_dir, model_type=args.model_type)
         stabl_cox.fit(X_sel, y_sel)
         
@@ -929,14 +948,15 @@ def run_pipeline(args):
         else:
             # Case 2: Full Features (Baseline)
             # Apply LowInfoFilter to remove constant/high-nan features
-            print("[INFO] Preprocessing Full Features: Applying LowInfoFilter.")
-            lif = LowInfoFilter(max_nan_fraction=0.2)
-            X_tr_np = lif.fit_transform(X_tr)
-            cols = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_tr.columns[lif.get_support()]
-            X_te_np = lif.transform(X_te)
+            print("[INFO] Preprocessing Full Features: Skipping LowInfoFilter (DISABLED).")
+            # lif = LowInfoFilter(max_nan_fraction=0.2)
+            # X_tr_np = lif.fit_transform(X_tr)
+            # cols = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_tr.columns[lif.get_support()]
+            # X_te_np = lif.transform(X_te)
             
-            X_tr = pd.DataFrame(X_tr_np, index=X_tr.index, columns=cols)
-            X_te = pd.DataFrame(X_te_np, index=X_te.index, columns=cols)
+            # X_tr = pd.DataFrame(X_tr_np, index=X_tr.index, columns=cols)
+            # X_te = pd.DataFrame(X_te_np, index=X_te.index, columns=cols)
+            pass
         
         imputer = SimpleImputer(strategy="median")
         X_tr = pd.DataFrame(imputer.fit_transform(X_tr), index=X_tr.index, columns=X_tr.columns)
