@@ -541,10 +541,10 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
                     df_core = pd.DataFrame({
                         "sample_id": df_analysis.index,
                         "Label": prognosis_labels,
-                        # "time": time_col,
-                        # "event": event_col,
-                        # "risk_score": data_values,
-                        # "threshold_used": threshold_val
+                        "time": time_col,
+                        "event": event_col,
+                        "risk_score": data_values,
+                        "threshold_used": threshold_val
                     })
                     
                     # Add gene expressions (drop T and E from df_analysis as we have them or don't need duplicates)
