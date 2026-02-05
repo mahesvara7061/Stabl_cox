@@ -71,7 +71,23 @@ def load_counts(counts_path, num_genes: int | None = None, debug_dir: str | None
     if df.shape[1] < 4:
         raise ValueError("File counts must have >= 4 columns (gene, entrez, and >=2 samples).")
 
-    gene_col = df.columns[0]
+    # --- Identify Gene Column by Name ---
+    col_map = {c.lower(): c for c in df.columns}
+    gene_candidates = ["gene_name", "gene_symbol", "symbol", "hugo_symbol", "gene"]
+    
+    gene_col = None
+    for cand in gene_candidates:
+        if cand in col_map:
+            gene_col = col_map[cand]
+            break
+            
+    if gene_col is None:
+        gene_col = df.columns[0]
+        print(f"[WARN] Could not find specific gene name column (e.g. 'gene_name'). Using first column '{gene_col}'.")
+    else:
+        print(f"[INFO] Found gene column: '{gene_col}'")
+
+    # Assuming samples start from column 2 (skipping gene_name and entrez_id usually in first 2 cols)
     sample_cols = df.columns[2:]
 
     # Build deterministic gene order
@@ -130,7 +146,7 @@ def load_clinical(clinical_path, target_type="OS"):
     # Be flexible but prioritize based on target_type
     if target_type.upper() == "RFS":
         time_cands = ["rfs_time", "dfs_time", "rfs_days", "rfs_months", "dfs_days", "df_time", "recurrence_time", "time_to_recurrence", "rfs", "dfs"]
-        event_cands = ["rfs_status", "dfs_status", "recurrence_status", "recurrence_event", "recurrence", "relapse", "relapse_status"]
+        event_cands = ["rfs_status", "dfs_status", "recurrence_status", "recurrence_event", "relapse", "relapse_status", "rfs_event"]
     else: # OS
         time_cands = ["os_time", "os_days", "os_months", "overall_survival", "overall survival", "survival_time", "survival time", "days_to_death", "days to death", "time", "os"]
         event_cands = ["os_status", "vital_status", "vital status", "censored", "censor", "status", "event", "survival_status", "os"]
@@ -541,10 +557,10 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
                     df_core = pd.DataFrame({
                         "sample_id": df_analysis.index,
                         "Label": prognosis_labels,
-                        # "time": time_col,
-                        # "event": event_col,
-                        # "risk_score": data_values,
-                        # "threshold_used": threshold_val
+                        "time": time_col,
+                        "event": event_col,
+                        "risk_score": data_values,
+                        "threshold_used": threshold_val
                     })
                     
                     # Add gene expressions (drop T and E from df_analysis as we have them or don't need duplicates)
@@ -671,7 +687,7 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
         save_path = Path(outdir) / csv_name
         res_df.to_csv(save_path, index=False)
         print(f"[DONE] Đã lưu phân tích đơn biến{label_str} tại: {save_path}")
-        print(res_df.to_string())
+        print(res_df.head().to_string())
     
     return local_cph, local_risk_median
 
@@ -725,9 +741,11 @@ def run_pipeline(args):
     X_sel = load_counts(args.selection_counts, num_genes=args.num_genes, debug_dir=args.debug_dir)
     y_sel = load_clinical(args.selection_clinical, target_type=args.target_type)
     X_sel, y_sel = align_X_y(X_sel, y_sel)
+    print("X_sel head:", X_sel.head())
+    print("y_sel head:", y_sel.head())
     
     # Preprocessing
-    print(f"[INFO] Preprocessing Selection Data (LIF, Impute, Scale)...")
+    print(f"[INFO] Preprocessing Selection Data (Impute, Scale)...")
     
     # Setup log dir for removed features
     removed_dir = Path(args.outdir) / "removed_features_logs"
@@ -822,6 +840,8 @@ def run_pipeline(args):
     X_verify = load_counts(args.verify_counts, num_genes=None, debug_dir=args.debug_dir) 
     y_verify = load_clinical(args.verify_clinical, target_type=args.target_type)
     X_verify, y_verify = align_X_y(X_verify, y_verify)
+    print("X_verify head:", X_verify.head())
+    print("y_verify head:", y_verify.head())
 
     # --- FILTER SELECTED FEATURES FOUND IN VERIFY ---
     verified_genes = [f for f in selected_features if f in X_verify.columns]
