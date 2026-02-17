@@ -149,7 +149,7 @@ def load_clinical(clinical_path, target_type="OS"):
         event_cands = ["rfs_status", "dfs_status", "recurrence_status", "recurrence_event", "relapse", "relapse_status", "rfs_event"]
     else: # OS
         time_cands = ["os_time", "os_days", "os_months", "overall_survival", "overall survival", "survival_time", "survival time", "days_to_death", "days to death", "time", "os"]
-        event_cands = ["os_status", "vital_status", "vital status", "censored", "censor", "status", "event", "survival_status", "os"]
+        event_cands = ["os_status", "vital_status", "vital status", "censored", "censor", "status", "event", "survival_status", "os", "os_event"]
 
     # 2. Search Time
     for cand in time_cands:
@@ -411,7 +411,7 @@ def evaluate_survival_model_comprehensive(model, X_train, y_train, X_test, y_tes
     return results
 
 
-def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", trained_model=None, trained_median=None):
+def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", trained_model=None, trained_median=None, refit_train_data=None, run_transfer=True, run_refit=True, run_univariate=True):
     """
     Phân tích chi tiết từng gene được chọn + Biosignature (Risk Score form Multivariate Cox):
     1. Univariate Cox Regression (HR, CI, p-value)
@@ -423,7 +423,10 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
         return None, None
 
     label_str = f" ({dataset_label})" if dataset_label else ""
-    print(f"\n[INFO] Đang phân tích đơn biến{label_str} cho {len(selected_features)} gene được chọn...")
+    if run_univariate:
+        print(f"\n[INFO] Đang phân tích đơn biến{label_str} cho {len(selected_features)} gene được chọn...")
+    else:
+        print(f"\n[INFO] Bỏ qua phân tích đơn biến{label_str}, chỉ chạy Biosignature...")
     
     folder_name = "individual_genes_analysis"
     csv_name = "univariate_analysis_selected_genes.csv"
@@ -580,39 +583,40 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
             print(f"Error plotting KM for {name_for_plot}: {e}")
 
     # --- Loop Genes ---
-    for gene in available_feats:
-        # Univariate Continuous Cox (Stats for CSV)
-        try:
-            cph = CoxPHFitter()
-            df_gene = df_analysis[[gene, 'T', 'E']].dropna()
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                cph.fit(df_gene, duration_col='T', event_col='E')
-            
-            summary = cph.summary.loc[gene]
-            hr = summary['exp(coef)']
-            lower_ci = summary['exp(coef) lower 95%']
-            upper_ci = summary['exp(coef) upper 95%']
-            p_val = summary['p']
-            
-            results.append({
-                "Gene": gene,
-                "Hazard_Ratio": hr,
-                "CI_Lower": lower_ci,
-                "CI_Upper": upper_ci,
-                "P_value": p_val,
-                "Role": "Risk" if hr > 1 else "Protective"
-            })
-        except Exception: pass
+    if run_univariate:
+        for gene in available_feats:
+            # Univariate Continuous Cox (Stats for CSV)
+            try:
+                cph = CoxPHFitter()
+                df_gene = df_analysis[[gene, 'T', 'E']].dropna()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    cph.fit(df_gene, duration_col='T', event_col='E')
+                
+                summary = cph.summary.loc[gene]
+                hr = summary['exp(coef)']
+                lower_ci = summary['exp(coef) lower 95%']
+                upper_ci = summary['exp(coef) upper 95%']
+                p_val = summary['p']
+                
+                results.append({
+                    "Gene": gene,
+                    "Hazard_Ratio": hr,
+                    "CI_Lower": lower_ci,
+                    "CI_Upper": upper_ci,
+                    "P_value": p_val,
+                    "Role": "Risk" if hr > 1 else "Protective"
+                })
+            except Exception: pass
 
-        # Plot KM (Individual Gene)
-        plot_km_with_stats(
-            df_analysis[gene].values,
-            gene,
-            df_analysis['T'].values,
-            df_analysis['E'].values,
-            out_path / f"KM_{gene}.png"
-        )
+            # Plot KM (Individual Gene)
+            plot_km_with_stats(
+                df_analysis[gene].values,
+                gene,
+                df_analysis['T'].values,
+                df_analysis['E'].values,
+                out_path / f"KM_{gene}.png"
+            )
     
     # --- Biosignature (Combined) ---
     local_cph = None
@@ -623,28 +627,43 @@ def analyze_individual_genes(X, y, selected_features, outdir, dataset_label="", 
         
         # Strategy 3: Refit on current dataset (Local Model, Median Threshold)
         # This is strictly local evaluation (Re-discovery)
-        try:
-            local_cph = CoxPHFitter(penalizer=0.1) # Add slight penalizer
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                local_cph.fit(df_analysis, duration_col='T', event_col='E')
-            
-            risk_scores_refit = local_cph.predict_partial_hazard(df_analysis)
-            local_risk_median = np.median(risk_scores_refit)
-            
-            plot_km_with_stats(
-                risk_scores_refit.values,
-                "Biosignature_Refit",
-                df_analysis['T'].values,
-                df_analysis['E'].values,
-                out_path / "KM_Biosignature_Refit.png",
-                add_to_results=True
-            )
-        except Exception as e:
-            print(f"   >> [WARN] Could not plot Biosignature (Refit): {e}")
+        if run_refit:
+            try:
+                local_cph = CoxPHFitter(penalizer=0.1) # Add slight penalizer
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    
+                    # Determine training data for Refit
+                    if refit_train_data is not None:
+                         X_fit, y_fit = refit_train_data
+                         print(f"      >> Strategy 3 (Refit): Training on Split Train ({X_fit.shape[0]} samples), Testing on Split Test")
+                         # Ensure X_fit has necessary columns
+                         df_fit = X_fit[available_feats].copy()
+                         df_fit['T'] = y_fit['time'].values
+                         df_fit['E'] = y_fit['event'].astype(int).values
+                         local_cph.fit(df_fit, duration_col='T', event_col='E')
+                    else:
+                         print(f"      >> Strategy 3 (Refit): Training and Testing on Full Data")
+                         local_cph.fit(df_analysis, duration_col='T', event_col='E')
+                
+                # Predict on Target Data (Test or Full)
+                risk_scores_refit = local_cph.predict_partial_hazard(df_analysis)
+                print(local_cph.params_.index.tolist())
+                local_risk_median = np.median(risk_scores_refit)
+                
+                plot_km_with_stats(
+                    risk_scores_refit.values,
+                    "Biosignature_Refit",
+                    df_analysis['T'].values,
+                    df_analysis['E'].values,
+                    out_path / "KM_Biosignature_Refit.png",
+                    add_to_results=True
+                )
+            except Exception as e:
+                print(f"   >> [WARN] Could not plot Biosignature (Refit): {e}")
 
         # Strategies 1 & 2: Transfer Learning (if external model provided)
-        if trained_model is not None:
+        if run_transfer and trained_model is not None:
             try:
                 print(f"   >> [INFO] Computing Biosignature Transfer Strategies...") 
                 # Predict Risk Score using External Model
@@ -717,7 +736,7 @@ def build_stabl_cox(n_bootstraps=500, random_state=42, debug_dir=None, model_typ
         artificial_proportion=1.0,
         sample_fraction=0.5,
         replace=False,
-        bootstrap_threshold="median",
+        bootstrap_threshold=1e-12,
         fdr_threshold_range=np.arange(0.05, 1.01, 0.05),
         explore=True,
         n_explore=5,
@@ -845,6 +864,12 @@ def run_pipeline(args):
 
     # --- FILTER SELECTED FEATURES FOUND IN VERIFY ---
     verified_genes = [f for f in selected_features if f in X_verify.columns]
+    print(f"\n[INFO] Verifying selected features in Verify dataset before sorting...    ")
+    print(f"       Selected Features: {list(verified_genes)}")
+    # sort descending 
+    verified_genes = sorted(verified_genes, key=lambda x: X_verify[x].sum(), reverse=True)
+    print(f"       Verified and Sorted Features: {verified_genes}") 
+    # đổi tên 1 cột để thử xem có lỗi gì không
     print(f"\n[INFO] {len(verified_genes)}/{len(selected_features)} selected features found in Verify dataset.")
     pd.Series(verified_genes, name="Verified_Features").to_csv(Path(args.outdir) / "verified_features.csv", index=False)
     
@@ -863,6 +888,26 @@ def run_pipeline(args):
     X_verify_base = X_verify.copy()
     X_verify_base = X_verify_base[verified_genes].replace([np.inf, -np.inf], np.nan)
     X_verify_base = X_verify_base.fillna(X_verify_base.median())
+
+    # --- 3b. Establish Evaluation Schemes ---
+    # User Request: 
+    # 1. Strategy 1 & 2 (Transfer) & Individual Gene Analysis -> ALWAYS on FULL Verify Data.
+    # 2. Strategy 3 (Refit) & Full Model Comparisons -> Run in TWO modes:
+    #    a. FULL Mode: Train on Full, Predict on Full (Self-eval).
+    #    b. SPLIT Mode: Train on Split-Train, Predict on Split-Test.
+    
+    # Use specified ratio or default to 0.3
+    test_ratio = args.verify_ratio if args.verify_ratio > 0 else 0.3
+    print(f"\n[INFO] Data Splitting Strategy: Test Ratio = {test_ratio}")
+
+    # Split Data (Stratified)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_verify, y_verify, test_size=test_ratio, random_state=args.seed, stratify=y_verify['event']
+    )
+    print(f"       Split Sizes -> Train: {X_train.shape[0]}, Test: {X_test.shape[0]}")
+    
+    train_idxs_split = X_train.index
+    test_idxs_split = X_test.index
 
     # --- PREPARE TRANSFER MODEL (TRAIN ON SELECTION WITH VERIFIED GENES ONLY) ---
     transfer_model = None
@@ -889,19 +934,15 @@ def run_pipeline(args):
             transfer_model = None
             transfer_median = None
 
-    # --- VARIANT 1: Selection Scaling (No Refit) ---
-    print("\n[INFO] [Variant 1] Scaling Verify Data using Selection Data statistics (No Refit)...")
+    # --- VARIANT 1: Selection Scaling ---
+    print("\n[INFO] [Variant 1] Scaling Verify Data using Selection Data statistics...")
     X_verify_sel = X_verify_base.copy()
     
     if 'scaler_feature_names' in locals():
         scaler_feats_set = set(scaler_feature_names) 
         valid_cols = [col for col in X_verify_sel.columns if col in scaler_feats_set]
-        missing_cols = list(set(X_verify_sel.columns) - set(valid_cols))
+        X_verify_sel = X_verify_sel[valid_cols] # Align cols
         
-        if missing_cols:
-            print(f"[WARN] {len(missing_cols)} features not found in Selection Scaler: {missing_cols}")
-            X_verify_sel = X_verify_sel[valid_cols]
-
         if not X_verify_sel.empty:
             feat_map = {name: i for i, name in enumerate(scaler_feature_names)}
             indices = [feat_map[col] for col in X_verify_sel.columns]
@@ -909,42 +950,111 @@ def run_pipeline(args):
             scale_vals = scaler.scale_[indices]
             X_verify_sel = (X_verify_sel - mean_vals) / scale_vals
     
+    # 1. FULL EVALUATION (Strategies 1, 2, 3-Full, Individual Genes)
+    print("      >> Mode [FULL]: Running Strategies 1, 2, 3 (Refit Full), Indiv. Genes...")
     analyze_individual_genes(
         X_verify_sel, y_verify, verified_genes, args.outdir, 
-        dataset_label="verify_selection_scaling",
+        dataset_label=f"verify_selection_scaling_FULL",
         trained_model=transfer_model, 
-        trained_median=transfer_median 
+        trained_median=transfer_median,
+        run_transfer=True, # S1, S2
+        run_refit=True,     # S3 (Refit on Full)
+        refit_train_data=None, # Train on passed X (Full)
+        run_univariate=True # Run Individual Gene Analysis
+    )
+    
+    # 2. SPLIT EVALUATION (Strategy 3-Split ONLY)
+    X_ver_sel_tr = X_verify_sel.loc[train_idxs_split]
+    X_ver_sel_te = X_verify_sel.loc[test_idxs_split]
+    print("      >> Mode [SPLIT]: Running Strategy 3 (Refit Split)...")
+    analyze_individual_genes(
+        X_ver_sel_te, y_test, verified_genes, args.outdir, 
+        dataset_label=f"verify_selection_scaling_SPLIT_TEST",
+        trained_model=None, 
+        trained_median=None,
+        run_transfer=False, # Skip S1, S2 (Done in Full)
+        run_refit=True,     # S3 (Refit on Split)
+        refit_train_data=(X_ver_sel_tr, y_train), # Train on Split Train
+        run_univariate=False # Skip Individual Genes
     )
 
-    # --- VARIANT 2: Independent Scaling (Refit on Verify) ---
-    print("\n[INFO] [Variant 2] Independent Scaling (Fit on Verify)...")
+    # --- VARIANT 2: Independent Scaling ---
+    print("\n[INFO] [Variant 2] Independent Scaling...")
     scaler_ver = StandardScaler()
-    X_verify_ind = pd.DataFrame(
-        scaler_ver.fit_transform(X_verify_base), 
-        index=X_verify_base.index, 
-        columns=X_verify_base.columns
+    
+    # 1. FULL (Scale Independent on Full)
+    X_verify_ind_full = pd.DataFrame(
+            scaler_ver.fit_transform(X_verify_base), 
+            index=X_verify_base.index, 
+            columns=X_verify_base.columns
     )
+    print("      >> Mode [FULL]: Running Strategies 1, 2, 3 (Refit Full), Indiv. Genes...")
     analyze_individual_genes(
-        X_verify_ind, y_verify, verified_genes, args.outdir, 
-        dataset_label="verify_independent_scaling",
+        X_verify_ind_full, y_verify, verified_genes, args.outdir, 
+        dataset_label=f"verify_independent_scaling_FULL",
         trained_model=transfer_model,
-        trained_median=transfer_median 
+        trained_median=transfer_median,
+        run_transfer=True,
+        run_refit=True,
+        refit_train_data=None,
+        run_univariate=True 
+    )
+    
+    # 2. SPLIT (Fit Scale on Train, Transform Test)
+    X_base_tr = X_verify_base.loc[train_idxs_split]
+    X_base_te = X_verify_base.loc[test_idxs_split]
+    
+    scaler_ver_split = StandardScaler()
+    scaler_ver_split.fit(X_base_tr)
+    
+    X_ver_ind_tr = pd.DataFrame(scaler_ver_split.transform(X_base_tr), index=X_base_tr.index, columns=X_base_tr.columns)
+    X_ver_ind_te = pd.DataFrame(scaler_ver_split.transform(X_base_te), index=X_base_te.index, columns=X_base_te.columns)
+    
+    print("      >> Mode [SPLIT]: Running Strategy 3 (Refit Split)...")
+    analyze_individual_genes(
+        X_ver_ind_te, y_test, verified_genes, args.outdir, 
+        dataset_label=f"verify_independent_scaling_SPLIT_TEST",
+        trained_model=None,
+        trained_median=None,
+        run_transfer=False,
+        run_refit=True,
+        refit_train_data=(X_ver_ind_tr, y_train),
+        run_univariate=False
     )
 
     # --- VARIANT 3: No Scaling ---
     print("\n[INFO] [Variant 3] No Scaling (Imputed only)...")
+    
+    # 1. FULL
+    print("      >> Mode [FULL]: Running Strategies 1, 2, 3 (Refit Full), Indiv. Genes...")
     analyze_individual_genes(
         X_verify_base, y_verify, verified_genes, args.outdir, 
-        dataset_label="verify_no_scaling",
+        dataset_label=f"verify_no_scaling_FULL",
         trained_model=transfer_model, 
-        trained_median=transfer_median 
+        trained_median=transfer_median,
+        run_transfer=True,
+        run_refit=True,
+        refit_train_data=None,
+        run_univariate=True
+    )
+    
+    # 2. SPLIT
+    X_ver_no_tr = X_verify_base.loc[train_idxs_split]
+    X_ver_no_te = X_verify_base.loc[test_idxs_split]
+    print("      >> Mode [SPLIT]: Running Strategy 3 (Refit Split)...")
+    analyze_individual_genes(
+        X_ver_no_te, y_test, verified_genes, args.outdir, 
+        dataset_label=f"verify_no_scaling_SPLIT_TEST",
+        trained_model=None, 
+        trained_median=None,
+        run_transfer=False,
+        run_refit=True,
+        refit_train_data=(X_ver_no_tr, y_train),
+        run_univariate=False
     )
 
-    # 3b. Split for Final Models
-    print(f"\n[STEP 3b] Splitting Verify Data (Test Ratio={args.verify_split_ratio})...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_verify, y_verify, test_size=args.verify_split_ratio, random_state=args.seed, stratify=y_verify['event']
-    )
+    
+    # (Step 3b removed as it is done above) (Variables X_train etc. are ready for Step 5)
 
     # ---------------------------------------------------------
     # 5. Preprocessing for Final Models
@@ -956,26 +1066,13 @@ def run_pipeline(args):
         if features is not None:
             # Case 1: Specific features requested (Verification of Selected Genes)
             # STRICTLY keep these genes found in Verify. NO LowInfoFilter.
-            print("[INFO] Preprocessing with Verified Genes: Skipping LowInfoFilter to preserve selected set.")
+            # print("[INFO] Preprocessing with Verified Genes: Skipping LowInfoFilter to preserve selected set.")
             valid_feats = [f for f in features if f in X_tr.columns]
-            if len(valid_feats) < len(features):
-                print(f"[WARN] Preprocessing: requested {len(features)} features, found {len(valid_feats)}.")
             
             X_tr = X_tr[valid_feats]
             X_te = X_te[valid_feats]
-            # NO LIF applied here
-            
         else:
             # Case 2: Full Features (Baseline)
-            # Apply LowInfoFilter to remove constant/high-nan features
-            print("[INFO] Preprocessing Full Features: Skipping LowInfoFilter (DISABLED).")
-            # lif = LowInfoFilter(max_nan_fraction=0.2)
-            # X_tr_np = lif.fit_transform(X_tr)
-            # cols = lif.get_feature_names_out() if hasattr(lif, "get_feature_names_out") else X_tr.columns[lif.get_support()]
-            # X_te_np = lif.transform(X_te)
-            
-            # X_tr = pd.DataFrame(X_tr_np, index=X_tr.index, columns=cols)
-            # X_te = pd.DataFrame(X_te_np, index=X_te.index, columns=cols)
             pass
         
         imputer = SimpleImputer(strategy="median")
@@ -987,16 +1084,6 @@ def run_pipeline(args):
         X_te = pd.DataFrame(scaler.transform(X_te), index=X_te.index, columns=X_te.columns)
         return X_tr, X_te
 
-    # 1. Selected Features Data
-    X_train_sub, X_test_sub = preprocess_data(X_train.copy(), X_test.copy(), features=verified_genes)
-    # 2. Full Features Data
-    print("[INFO] Processing Full Features Data (this might take a while)...")
-    X_train_full, X_test_full = preprocess_data(X_train.copy(), X_test.copy())
-
-    # Structured arrays for sksurv
-    y_train_surv = Surv.from_arrays(event=y_train['event'].astype(bool).values, time=y_train['time'].values)
-    y_test_surv = Surv.from_arrays(event=y_test['event'].astype(bool).values, time=y_test['time'].values)
-
     def get_models(seed):
         return {
             "CoxPH": CoxPHSurvivalAnalysis(),
@@ -1007,63 +1094,73 @@ def run_pipeline(args):
 
     results_list = []
 
-    # --- 1. Evaluate on SELECTED Features ---
-    print(f"\n--- Evaluating Models on SELECTED Features ({X_train_sub.shape[1]} features) ---")
-    models_sub = get_models(args.seed)
-    for name, model in models_sub.items():
-        if name == "CoxPH" and X_train_sub.shape[1] > X_train_sub.shape[0]:
-            print(f"Skipping {name} (p > n)")
-            continue
-            
-        try:
-            model.fit(X_train_sub, y_train_surv)
-            
-            # --- GỌI HÀM ĐÁNH GIÁ NÂNG CAO ---
-            eval_res = evaluate_survival_model_comprehensive(
-                model, X_train_sub, y_train_surv, X_test_sub, y_test_surv, 
-                model_name=f"{name}_Selected", outdir=args.outdir
-            )
-            
-            res_entry = {
-                "Feature_Set": "Selected",
-                "Model": name,
-                "Num_Features": X_train_sub.shape[1]
-            }
-            res_entry.update(eval_res)
-            results_list.append(res_entry)
+    # --- Wrapper for Running Evaluation Cycle ---
+    def run_model_comparisons(X_tr_raw, y_tr_raw, X_te_raw, y_te_raw, label_suffix=""):
+        print(f"\n>>>> Running Full Model Comparisons [Mode: {label_suffix}]")
+        
+        # A. Selected Features
+        X_tr_sel, X_te_sel = preprocess_data(X_tr_raw.copy(), X_te_raw.copy(), features=verified_genes)
+        y_tr_surv = Surv.from_arrays(event=y_tr_raw['event'].astype(bool).values, time=y_tr_raw['time'].values)
+        y_te_surv = Surv.from_arrays(event=y_te_raw['event'].astype(bool).values, time=y_te_raw['time'].values)
 
-        except Exception as e:
-            print(f"[{name}] Failed on Selected Features: {e}")
-            traceback.print_exc()
-
-    # --- 2. Evaluate on FULL Features ---
-    print(f"\n--- Evaluating Models on FULL Features ({X_train_full.shape[1]} features) ---")
-    models_full = get_models(args.seed)
-    for name, model in models_full.items():
-        if name == "CoxPH" and X_train_full.shape[1] > X_train_full.shape[0]:
-            print(f"Skipping {name} on Full Features (p > n)")
-            continue
-
-        try:
-            print(f"Training {name} on Full Features...")
-            model.fit(X_train_full, y_train_surv)
+        print(f"     Evaluating on SELECTED Features ({X_tr_sel.shape[1]} features)...")
+        models_sub = get_models(args.seed)
+        for name, model in models_sub.items():
+            if name == "CoxPH" and X_tr_sel.shape[1] > X_tr_sel.shape[0]:
+                 # print(f"Skipping {name} (p > n)")
+                 continue
             
-            eval_res = evaluate_survival_model_comprehensive(
-                model, X_train_full, y_train_surv, X_test_full, y_test_surv, 
-                model_name=f"{name}_Full", outdir=args.outdir
-            )
-            
-            res_entry = {
-                "Feature_Set": "Full",
-                "Model": name,
-                "Num_Features": X_train_full.shape[1]
-            }
-            res_entry.update(eval_res)
-            results_list.append(res_entry)
+            try:
+                model.fit(X_tr_sel, y_tr_surv)
+                eval_res = evaluate_survival_model_comprehensive(
+                    model, X_tr_sel, y_tr_surv, X_te_sel, y_te_surv, 
+                    model_name=f"{name}_Selected_{label_suffix}", outdir=args.outdir
+                )
+                res_entry = {
+                    "Feature_Set": "Selected",
+                    "Model": name,
+                    "Mode": label_suffix,
+                    "Num_Features": X_tr_sel.shape[1]
+                }
+                res_entry.update(eval_res)
+                results_list.append(res_entry)
+            except Exception as e:
+                print(f"[{name}] Failed on Selected Features: {e}")
 
-        except Exception as e:
-            print(f"[{name}] Failed on Full Features: {e}")
+        # B. Full Features
+        print(f"     Evaluating on FULL Features...")
+        X_tr_full, X_te_full = preprocess_data(X_tr_raw.copy(), X_te_raw.copy())
+        
+        models_full = get_models(args.seed)
+        for name, model in models_full.items():
+            if name == "CoxPH" and X_tr_full.shape[1] > X_tr_full.shape[0]:
+                 # print(f"Skipping {name} on Full Features (p > n)")
+                 continue
 
+            try:
+                # print(f"Training {name} on Full Features...")
+                model.fit(X_tr_full, y_tr_surv)
+                eval_res = evaluate_survival_model_comprehensive(
+                    model, X_tr_full, y_tr_surv, X_te_full, y_te_surv, 
+                    model_name=f"{name}_AllFeatures_{label_suffix}", outdir=args.outdir
+                )
+                res_entry = {
+                    "Feature_Set": "All_Features",
+                    "Model": name,
+                    "Mode": label_suffix,
+                    "Num_Features": X_tr_full.shape[1]
+                }
+                res_entry.update(eval_res)
+                results_list.append(res_entry)
+            except Exception as e:
+                print(f"[{name}] Failed on Full Features: {e}")
+
+    # 1. RUN ON FULL (Internal/Self eval)
+    run_model_comparisons(X_verify, y_verify, X_verify, y_verify, label_suffix="FULL")
+
+    # 2. RUN ON SPLIT (Holdout eval)
+    run_model_comparisons(X_train, y_train, X_test, y_test, label_suffix="SPLIT_TEST")
+    
     # ---------------------------------------------------------
     # 6. Save Final Results
     # ---------------------------------------------------------
@@ -1131,7 +1228,7 @@ if __name__ == "__main__":
     # Verify Data (To be split)
     parser.add_argument("--verify_counts", required=True, help="Path to counts file for Verification")
     parser.add_argument("--verify_clinical", required=True, help="Path to clinical file for Verification")
-    parser.add_argument("--verify_split_ratio", type=float, default=0.3, help="Ratio of Verify data to use for Testing (default: 0.3)")
+    parser.add_argument("--verify_ratio", type=float, default=0.3, help="Ratio of Verify data to use for Testing. Default 0.3 (30%% test). If set to 0, split strategy might use default or fail.")
     
     parser.add_argument("--outdir", required=True, help="Output directory")
     parser.add_argument("--n_boot", type=int, default=200, help="Number of bootstraps for STABL")

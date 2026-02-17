@@ -191,8 +191,8 @@ run_ml_batch <- function(
     ggsave(
       filename = roc_path, 
       plot = p_RocCurve, 
-      width = 6,        # MODIFY: Adjust plot dimensions
-      height = 6, 
+      width = 7,        # MODIFY: Adjust plot dimensions
+      height = 7, 
       dpi = 600         # MODIFY: Adjust resolution
     )
   }
@@ -408,7 +408,7 @@ run_ml_batch <- function(
 # USAGE EXAMPLE
 # ============================================================================
 # Prepare your data
-my_data <- read.csv("/mnt/d/Labs/Pharmaco-Omics/stabl/data/HCC/recurrence_processed/tcga_processed/ML_Input_TCGA_LIHC_Recurrence_16_genes.csv", row.names = 1, check.names = FALSE)
+my_data <- read.csv("/mnt/d/Labs/Pharmaco-Omics/stabl/data/HCC/recurrence_processed/gse14520_processed/ML_Input_GSE14520_Recurrence_4_genes.csv", row.names = 1, check.names = FALSE)
 
 # Run batch analysis with clinical covariates included
 run_ml_batch(
@@ -422,7 +422,7 @@ run_ml_batch(
   base_seed         = 20251202,
   seeds_file        = NULL,
   start_index       = 1,
-  out_dir           = "/mnt/d/labs/pharmaco-omics/stabl/results_HCC_Recurrence_16_genes",
+  out_dir           = "/mnt/d/labs/pharmaco-omics/stabl/results_HCC_Recurrence_4_genes_gse14520",
   split_ratio       = 0.7,
   kouter            = 5,
   kinner            = 5,

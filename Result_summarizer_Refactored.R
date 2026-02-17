@@ -376,7 +376,7 @@ run_batch_comparison <- function(
 # Uncomment and edit below to run:
 
 analyze_auc_single(
-  input_dir = "/mnt/d/Labs/Pharmaco-Omics/stabl/results_HCC_Recurrence_16_genes",
+  input_dir = "/mnt/d/Labs/Pharmaco-Omics/stabl/results_HCC_Recurrence_16_genes_v2",
   models    = c("LOGIT", "RF", "PLSDA", "SVM"),
-  out_dir   = "/mnt/d/Labs/Pharmaco-Omics/stabl/results_HCC_Recurrence_16_genes_SUMMARY"
+  out_dir   = "/mnt/d/Labs/Pharmaco-Omics/stabl/results_HCC_Recurrence_16_genes_v2_SUMMARY"
 )

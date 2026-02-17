@@ -966,6 +966,95 @@ def save_stabl_results(
 #     )
 
 #     return features_selection.get_support()
+# def fit_bootstrapped_sample(
+#         base_estimator,
+#         X,
+#         y,
+#         lambda_val,
+#         corr_groups=None,
+#         threshold=None
+# ):
+#     """
+#     Fits base_estimator on a bootstrap sample of the original data,
+#     and returns a mask of the variables that are selected by the fitted model.
+#     Now robust to cases where SelectFromModel/support length mismatches X.
+#     """
+#     # Set hyperparams for this bootstrap
+#     base_estimator.set_params(**lambda_val)
+#     if hasattr(base_estimator, "groups"):
+#         base_estimator.set_params(groups=corr_groups)
+
+#     # Fit on the (subsampled) data
+#     try:
+#         with warnings.catch_warnings():
+#             warnings.filterwarnings("ignore", message="all coefficients are zero")
+#             base_estimator.fit(X, y)
+#     except (ArithmeticError, ValueError) as e:
+#         # Coxnet numerical error or other fit failures
+#         return np.zeros(X.shape[1], dtype=bool)
+
+#     n_features = X.shape[1]
+
+#     # --- Try the usual SelectFromModel path ---
+#     try:
+#         features_selection = SelectFromModel(
+#             estimator=base_estimator,
+#             threshold=threshold,
+#             prefit=True
+#         )
+#         support = features_selection.get_support()
+#         if support.shape[0] == n_features:
+#             return support
+#         # nếu chiều lệch, rơi xuống fallback
+#         raise RuntimeError("support length mismatch")
+#     except Exception:
+#         print("SelectFromModel bị lỗi, phải fallback")
+#         # --- Fallback: tự dựng mask từ coef_/feature_importances_ rồi ép chiều ---
+#         coef = None
+        
+#         # Try coef_
+#         try:
+#             if hasattr(base_estimator, "coef_") and base_estimator.coef_ is not None:
+#                 coef = np.ravel(base_estimator.coef_)
+#         except (AttributeError, NotImplementedError):
+#             pass
+
+#         # Try feature_importances_
+#         if coef is None:
+#             try:
+#                 # Note: hasattr might raise NotImplementedError for RSF
+#                 if hasattr(base_estimator, "feature_importances_"):
+#                     coef = np.ravel(base_estimator.feature_importances_)
+#             except (AttributeError, NotImplementedError):
+#                 pass
+        
+#         # Try permutation_importance as last resort (e.g. for RandomSurvivalForest)
+#         if coef is None:
+#             try:
+#                 from sklearn.inspection import permutation_importance
+#                 # Run on training data (bootstrap sample) for proxy importance
+#                 result = permutation_importance(
+#                     base_estimator, X, y, n_repeats=1, random_state=None
+#                 )
+#                 coef = result.importances_mean
+#             except Exception:
+#                 pass
+
+#         if coef is None:
+#             # Bó tay: chọn none để không làm vstack lỗi
+#             return np.zeros(n_features, dtype=bool)
+
+#         # Ép chiều: pad nếu thiếu, cắt nếu thừa
+#         if coef.shape[0] < n_features:
+#             coef = np.pad(coef, (0, n_features - coef.shape[0]))
+#         elif coef.shape[0] > n_features:
+#             coef = coef[:n_features]
+
+#         # Ngưỡng: nếu threshold là số, dùng luôn; nếu không, dùng ngưỡng nhỏ
+#         # (tránh all-zero do regularization quá mạnh)
+#         thr = float(threshold) if isinstance(threshold, (int, float)) else 1e-12
+#         support = np.abs(coef) > thr
+#         return support
 def fit_bootstrapped_sample(
         base_estimator,
         X,
@@ -996,6 +1085,7 @@ def fit_bootstrapped_sample(
     n_features = X.shape[1]
 
     # --- Try the usual SelectFromModel path ---
+    # Đây là đường chính đạo (Happy path)
     try:
         features_selection = SelectFromModel(
             estimator=base_estimator,
@@ -1003,57 +1093,105 @@ def fit_bootstrapped_sample(
             prefit=True
         )
         support = features_selection.get_support()
+        
+        # Nếu số lượng khớp nhau -> Trả về luôn
         if support.shape[0] == n_features:
             return support
-        # nếu chiều lệch, rơi xuống fallback
-        raise RuntimeError("support length mismatch")
+            
+        # Nếu chiều lệch, ném lỗi để nhảy xuống fallback xử lý thủ công
+        raise RuntimeError(f"support length mismatch: expected {n_features}, got {support.shape[0]}")
     except Exception:
-        # --- Fallback: tự dựng mask từ coef_/feature_importances_ rồi ép chiều ---
-        coef = None
-        
-        # Try coef_
+        pass # Rơi xuống fallback bên dưới
+
+    # =========================================================================
+    # FALLBACK: TỰ DỰNG MASK THỦ CÔNG (MANUAL SELECTION)
+    # =========================================================================
+    coef = None
+    
+    # 1. Trích xuất hệ số (Coefficients / Importances)
+    try:
+        if hasattr(base_estimator, "coef_") and base_estimator.coef_ is not None:
+            coef = np.ravel(base_estimator.coef_)
+    except (AttributeError, NotImplementedError):
+        pass
+
+    if coef is None:
         try:
-            if hasattr(base_estimator, "coef_") and base_estimator.coef_ is not None:
-                coef = np.ravel(base_estimator.coef_)
+            if hasattr(base_estimator, "feature_importances_"):
+                coef = np.ravel(base_estimator.feature_importances_)
         except (AttributeError, NotImplementedError):
             pass
+    
+    # Permutation importance (chậm, giải pháp cuối cùng)
+    if coef is None:
+        try:
+            from sklearn.inspection import permutation_importance
+            result = permutation_importance(
+                base_estimator, X, y, n_repeats=1, random_state=None
+            )
+            coef = result.importances_mean
+        except Exception:
+            pass
 
-        # Try feature_importances_
-        if coef is None:
-            try:
-                # Note: hasattr might raise NotImplementedError for RSF
-                if hasattr(base_estimator, "feature_importances_"):
-                    coef = np.ravel(base_estimator.feature_importances_)
-            except (AttributeError, NotImplementedError):
-                pass
+    # Nếu vẫn không lấy được gì -> Trả về mảng rỗng
+    if coef is None:
+        return np.zeros(n_features, dtype=bool)
+
+    # 2. Xử lý lệch chiều (Shape Mismatch & Intercept Handling)
+    # -------------------------------------------------------------------------
+    # Kiểm tra xem có phải là ComponentwiseGradientBoostingSurvivalAnalysis không
+    # Dùng string check để tránh lỗi import nếu sksurv chưa được import ở đây
+    est_name = base_estimator.__class__.__name__
+    is_componentwise_gb = "ComponentwiseGradientBoostingSurvivalAnalysis" in est_name
+    
+    # CASE ĐẶC BIỆT: ComponentwiseGradientBoosting luôn thừa 1 Intercept ở đầu
+    if is_componentwise_gb and coef.shape[0] == n_features + 1:
+        print("Detected ComponentwiseGradientBoostingSurvivalAnalysis with Intercept, adjusting coef shape.")
+        # Bỏ phần tử đầu tiên (Intercept), lấy toàn bộ phần sau
+        coef = coef[1:]
+    
+    # CASE CHUNG: Ép chiều cho khớp n_features
+    if coef.shape[0] < n_features:
+        # Thiếu thì bù số 0 vào cuối
+        coef = np.pad(coef, (0, n_features - coef.shape[0]))
+    elif coef.shape[0] > n_features:
+        # Thừa thì cắt bớt đuôi (Lưu ý: Nếu không phải ComponentwiseGB thì cắt đuôi là chuẩn)
+        coef = coef[:n_features]
+
+    # 3. Tính toán Ngưỡng (Threshold Calculation)
+    # -------------------------------------------------------------------------
+    # Mô phỏng lại logic của SelectFromModel để xử lý "median", "mean" hoặc float
+    importances = np.abs(coef)
+    thr = 1e-5 # Default fallback
+
+    if isinstance(threshold, (int, float)):
+        # Nếu là số cố định
+        thr = float(threshold)
         
-        # Try permutation_importance as last resort (e.g. for RandomSurvivalForest)
-        if coef is None:
+    elif isinstance(threshold, str):
+        # Nếu là chuỗi (vd: "median", "1.25*mean")
+        statistic = np.mean(importances) # mặc định là mean
+        
+        if "median" in threshold:
+            statistic = np.median(importances)
+        elif "mean" in threshold:
+            statistic = np.mean(importances)
+            
+        # Xử lý hệ số nhân (scaling factor), vd: "1.25*mean"
+        if "*" in threshold:
             try:
-                from sklearn.inspection import permutation_importance
-                # Run on training data (bootstrap sample) for proxy importance
-                result = permutation_importance(
-                    base_estimator, X, y, n_repeats=1, random_state=None
-                )
-                coef = result.importances_mean
-            except Exception:
-                pass
-
-        if coef is None:
-            # Bó tay: chọn none để không làm vstack lỗi
-            return np.zeros(n_features, dtype=bool)
-
-        # Ép chiều: pad nếu thiếu, cắt nếu thừa
-        if coef.shape[0] < n_features:
-            coef = np.pad(coef, (0, n_features - coef.shape[0]))
-        elif coef.shape[0] > n_features:
-            coef = coef[:n_features]
-
-        # Ngưỡng: nếu threshold là số, dùng luôn; nếu không, dùng ngưỡng nhỏ
-        # (tránh all-zero do regularization quá mạnh)
-        thr = float(threshold) if isinstance(threshold, (int, float)) else 1e-12
-        support = np.abs(coef) > thr
-        return support
+                scale = float(threshold.split("*")[0])
+                thr = scale * statistic
+            except ValueError:
+                thr = statistic
+        else:
+            thr = statistic
+    
+    # Tạo mask cuối cùng
+    # Dùng > thay vì >= để an toàn với các giá trị 0.0 tuyệt đối
+    support = importances > thr
+    
+    return support
 
 
 
